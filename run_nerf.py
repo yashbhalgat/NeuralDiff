@@ -17,7 +17,9 @@ import matplotlib.pyplot as plt
 
 from run_nerf_helpers import *
 from radam import RAdam
-from loss import sigma_sparsity_loss, total_variation_loss
+from extra_losses import sigma_sparsity_loss, total_variation_loss
+
+from load_epic_kitchens import load_epic_kitchens_data
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 np.random.seed(0)
@@ -596,7 +598,18 @@ def train():
     # Load data
     K = None
 
-    ### TODO: Fill in dataset loading stuff
+    if args.dataset_type=="epic_kitchens":
+        images, poses, render_poses, hwf, i_split, bounding_box, near_far = load_epic_kitchens_data(args.datadir)
+        near, far = near_far
+        args.bounding_box = bounding_box
+        print('Loaded llff', images.shape, hwf, args.datadir)
+
+        i_train, i_val, i_test = i_split
+        pdb.set_trace()
+    
+    else:
+        print('Unknown dataset type', args.dataset_type, 'exiting')
+        return
 
     # Cast intrinsics to right types
     H, W, focal = hwf

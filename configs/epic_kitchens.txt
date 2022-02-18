@@ -1,0 +1,11 @@
+expname = EPIC_P01_01
+basedir = ./logs
+datadir = ./data/EPIC-Diff/P01_01
+dataset_type = epic_kitchens
+
+N_rand = 1024
+N_samples = 64
+N_importance = 64
+
+use_viewdirs = True
+raw_noise_std = 1e0
