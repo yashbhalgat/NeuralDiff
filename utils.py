@@ -127,3 +127,46 @@ def init_model(ckpt_path, dataset):
             ]
 
     return model
+
+
+
+#################################################################
+### Hash Encoding Utils
+#################################################################
+from ray_utils import get_rays, get_ray_directions, get_ndc_rays
+
+BOX_OFFSETS = torch.tensor([[[i,j,k] for i in [0, 1] for j in [0, 1] for k in [0, 1]]],
+                               device='cuda')
+
+def hash(coords, log2_hashmap_size):
+    '''
+    coords: 3D coordinates. B x 3
+    log2T:  logarithm of T w.r.t 2
+    '''
+    x, y, z = coords[..., 0], coords[..., 1], coords[..., 2]
+    return ((1<<log2_hashmap_size)-1) & (x*73856093 ^ y*19349663 ^ z*83492791)
+
+
+def get_voxel_vertices(xyz, bounding_box, resolution, log2_hashmap_size):
+    '''
+    xyz: 3D coordinates of samples. B x 3
+    bounding_box: min and max x,y,z coordinates of object bbox
+    resolution: number of voxels per axis
+    '''
+    box_min, box_max = bounding_box
+
+    if not torch.all(xyz <= box_max) or not torch.all(xyz >= box_min):
+        # print("ALERT: some points are outside bounding box. Clipping them!")
+        pdb.set_trace()
+        xyz = torch.clamp(xyz, min=box_min, max=box_max)
+
+    grid_size = (box_max-box_min)/resolution
+
+    bottom_left_idx = torch.floor((xyz-box_min)/grid_size).int()
+    voxel_min_vertex = bottom_left_idx*grid_size + box_min
+    voxel_max_vertex = voxel_min_vertex + torch.tensor([1.0,1.0,1.0])*grid_size
+
+    voxel_indices = bottom_left_idx.unsqueeze(1) + BOX_OFFSETS
+    hashed_voxel_indices = hash(voxel_indices, log2_hashmap_size)
+
+    return voxel_min_vertex, voxel_max_vertex, hashed_voxel_indices
