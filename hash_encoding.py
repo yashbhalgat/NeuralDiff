@@ -19,7 +19,7 @@ class HashEmbedder(nn.Module):
         self.finest_resolution = torch.tensor(finest_resolution)
         self.out_dim = self.n_levels * self.n_features_per_level
 
-        self.b = torch.exp((torch.log(self.finest_resolution)-torch.log(self.base_resolution))/(n_levels-1))
+        self.b = torch.exp((torch.log(self.finest_resolution.float())-torch.log(self.base_resolution.float()))/(n_levels-1))
 
         self.embeddings = nn.ModuleList([nn.Embedding(2**self.log2_hashmap_size, \
                                         self.n_features_per_level) for i in range(n_levels)])

@@ -136,19 +136,20 @@ def init_model(ckpt_path, dataset):
 #################################################################
 from ray_utils import get_rays, get_ray_directions, get_ndc_rays
 
-BOX_OFFSETS = torch.tensor([[[i,j,k] for i in [0, 1] for j in [0, 1] for k in [0, 1]]],
+BOX_OFFSETS = torch.tensor([[[i,j,k,l] for i in [0, 1] for j in [0, 1] for k in [0, 1] for l in [0, 1]]],
                                device='cuda')
 
 def hash(coords, log2_hashmap_size):
     '''
-    coords: 3D coordinates. B x 3
+    coords: XYZ+time coordinates. B x 4
     log2T:  logarithm of T w.r.t 2
     '''
-    x, y, z = coords[..., 0], coords[..., 1], coords[..., 2]
-    return ((1<<log2_hashmap_size)-1) & (x*73856093 ^ y*19349663 ^ z*83492791)
+    x, y, z, t = coords[..., 0], coords[..., 1], coords[..., 2], coords[..., 3]
+    primes = [2654435761, 805459861, 3674653429, 2097192037]
+    return ((1<<log2_hashmap_size)-1) & (x*primes[0] ^ y*primes[1] ^ z*primes[2] ^ t*primes[3])
 
 
-def get_voxel_vertices(xyz, bounding_box, resolution, log2_hashmap_size):
+def get_voxel_vertices(xyzt, bounding_box, resolution, log2_hashmap_size):
     '''
     xyz: 3D coordinates of samples. B x 3
     bounding_box: min and max x,y,z coordinates of object bbox
@@ -156,16 +157,16 @@ def get_voxel_vertices(xyz, bounding_box, resolution, log2_hashmap_size):
     '''
     box_min, box_max = bounding_box
 
-    if not torch.all(xyz <= box_max) or not torch.all(xyz >= box_min):
+    if not torch.all(xyzt <= box_max) or not torch.all(xyzt >= box_min):
         # print("ALERT: some points are outside bounding box. Clipping them!")
         pdb.set_trace()
-        xyz = torch.clamp(xyz, min=box_min, max=box_max)
+        xyzt = torch.clamp(xyzt, min=box_min, max=box_max)
 
     grid_size = (box_max-box_min)/resolution
 
-    bottom_left_idx = torch.floor((xyz-box_min)/grid_size).int()
+    bottom_left_idx = torch.floor((xyzt-box_min)/grid_size).int()
     voxel_min_vertex = bottom_left_idx*grid_size + box_min
-    voxel_max_vertex = voxel_min_vertex + torch.tensor([1.0,1.0,1.0])*grid_size
+    voxel_max_vertex = voxel_min_vertex + torch.tensor([1.0,1.0,1.0,1.0])*grid_size
 
     voxel_indices = bottom_left_idx.unsqueeze(1) + BOX_OFFSETS
     hashed_voxel_indices = hash(voxel_indices, log2_hashmap_size)
@@ -201,5 +202,4 @@ def get_bbox3d_for_epickitchens(metas, H, W, near, far):
             find_min_max(min_point)
             find_min_max(max_point)
 
-    pdb.set_trace()
     return (torch.tensor(min_bound)-torch.tensor([1.0,1.0,1.0]), torch.tensor(max_bound)+torch.tensor([1.0,1.0,1.0]))

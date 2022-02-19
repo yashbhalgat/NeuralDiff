@@ -68,7 +68,7 @@ def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
     return all_ret
 
 
-def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
+def render(H, W, K, chunk=1024*32, rays=None, c2w=None, time_coords=None, ndc=True,
                   near=0., far=1.,
                   use_viewdirs=False, c2w_staticcam=None,
                   **kwargs):
@@ -97,9 +97,13 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
     if c2w is not None:
         # special case to render full image
         rays_o, rays_d = get_rays(H, W, K, c2w)
+        if time_coords is None:
+            pdb.set_trace()
+            print("Alert! for single image case, time_coord should be provided")
     else:
         # use provided ray batch
-        rays_o, rays_d = rays
+        rays_o, rays_d, time_coords = rays
+        time_coords = time_coords[:,0]
 
     if use_viewdirs:
         # provide ray directions as input
@@ -124,6 +128,9 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
     if use_viewdirs:
         rays = torch.cat([rays, viewdirs], -1)
 
+    # Attach time coordinates
+    rays = torch.cat([rays, time_coords[:,None]], -1)
+    
     # Render and reshape
     all_ret = batchify_rays(rays, chunk, **kwargs)
     for k in all_ret:
@@ -136,7 +143,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
     return ret_list + [ret_dict]
 
 
-def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedir=None, render_factor=0):
+def render_path(render_poses, render_frame_idxs, hwf, K, chunk, render_kwargs, gt_imgs=None, savedir=None, render_factor=0):
 
     H, W, focal = hwf
 
@@ -153,7 +160,7 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
     for i, c2w in enumerate(tqdm(render_poses)):
         print(i, time.time() - t)
         t = time.time()
-        rgb, disp, acc, _ = render(H, W, K, chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
+        rgb, disp, acc, _ = render(H, W, K, chunk=chunk, c2w=c2w[:3,:4], time_coords=render_frame_idxs[i], **render_kwargs)
         rgbs.append(rgb.cpu().numpy())
         disps.append(disp.cpu().numpy())
         if i==0:
@@ -398,7 +405,8 @@ def render_rays(ray_batch,
     """
     N_rays = ray_batch.shape[0]
     rays_o, rays_d = ray_batch[:,0:3], ray_batch[:,3:6] # [N_rays, 3] each
-    viewdirs = ray_batch[:,-3:] if ray_batch.shape[-1] > 8 else None
+    time_coords = ray_batch[:,-1]
+    viewdirs = ray_batch[:,-4:-1] if ray_batch.shape[-1] > 8 else None
     bounds = torch.reshape(ray_batch[...,6:8], [-1,1,2])
     near, far = bounds[...,0], bounds[...,1] # [-1,1]
 
@@ -427,6 +435,7 @@ def render_rays(ray_batch,
         z_vals = lower + (upper - lower) * t_rand
 
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
+    pts = torch.cat([pts, time_coords[:,None].expand(pts.shape[:-1])[:,:,None]], dim=-1)
 
 #     raw = run_network(pts)
     raw = network_query_fn(pts, viewdirs, network_fn)
@@ -573,9 +582,9 @@ def config_parser():
                         help='frequency of tensorboard image logging')
     parser.add_argument("--i_weights", type=int, default=10000, 
                         help='frequency of weight ckpt saving')
-    parser.add_argument("--i_testset", type=int, default=1000, 
+    parser.add_argument("--i_testset", type=int, default=100, 
                         help='frequency of testset saving')
-    parser.add_argument("--i_video",   type=int, default=5000, 
+    parser.add_argument("--i_video",   type=int, default=500000, 
                         help='frequency of render_poses video saving')
 
     parser.add_argument("--finest_res",   type=int, default=512, 
@@ -599,13 +608,12 @@ def train():
     K = None
 
     if args.dataset_type=="epic_kitchens":
-        images, poses, render_poses, hwf, i_split, bounding_box, near_far = load_epic_kitchens_data(args.datadir)
+        images, poses, render_poses, hwf, i_split, bounding_box, near_far, all_frame_idxs = load_epic_kitchens_data(args.datadir)
         near, far = near_far
         args.bounding_box = bounding_box
         print('Loaded llff', images.shape, hwf, args.datadir)
 
         i_train, i_val, i_test = i_split
-        pdb.set_trace()
     
     else:
         print('Unknown dataset type', args.dataset_type, 'exiting')
@@ -625,6 +633,7 @@ def train():
 
     if args.render_test:
         render_poses = np.array(poses[i_test])
+        render_frame_idxs = all_frame_idxs[i_test]
 
     # Create log dir and copy the config file
     basedir = args.basedir
@@ -669,6 +678,7 @@ def train():
 
     # Move testing data to GPU
     render_poses = torch.Tensor(render_poses).to(device)
+    render_frame_idxs = torch.Tensor(render_frame_idxs).to(device)
 
     # Short circuit if only rendering out from trained model
     if args.render_only:
@@ -685,7 +695,7 @@ def train():
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', render_poses.shape)
 
-            rgbs, _ = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test, gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
+            rgbs, _ = render_path(render_poses, render_frame_idxs, hwf, K, args.chunk, render_kwargs_test, gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
             print('Done rendering', testsavedir)
             imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
 
@@ -701,8 +711,14 @@ def train():
         print('done, concats')
         rays_rgb = np.concatenate([rays, images[:,None]], 1) # [N, ro+rd+rgb, H, W, 3]
         rays_rgb = np.transpose(rays_rgb, [0,2,3,1,4]) # [N, H, W, ro+rd+rgb, 3]
+        N, H, W = rays_rgb.shape[:3]
+
+        ##### Appending time coordinates!!!
+        broadcasted_frame_idxs = np.broadcast_to(all_frame_idxs[:, np.newaxis, np.newaxis, np.newaxis, np.newaxis], [N, H, W, 1, 3])
+        rays_rgb = np.concatenate([rays_rgb, broadcasted_frame_idxs], 3)
+
         rays_rgb = np.stack([rays_rgb[i] for i in i_train], 0) # train images only
-        rays_rgb = np.reshape(rays_rgb, [-1,3,3]) # [(N-1)*H*W, ro+rd+rgb, 3]
+        rays_rgb = np.reshape(rays_rgb, [-1,rays_rgb.shape[-2],rays_rgb.shape[-1]]) # [(N-1)*H*W, ro+rd+rgb+t, 3]
         rays_rgb = rays_rgb.astype(np.float32)
         print('shuffle rays')
         np.random.shuffle(rays_rgb)
@@ -738,7 +754,9 @@ def train():
             # Random over all images
             batch = rays_rgb[i_batch:i_batch+N_rand] # [B, 2+1, 3*?]
             batch = torch.transpose(batch, 0, 1)
-            batch_rays, target_s = batch[:2], batch[2]
+            # batch_rays, target_s = batch[:2], batch[2]
+            ## including time coordinates in the ray tensor too
+            batch_rays, target_s = batch[[0, 1, 3]], batch[2]
 
             i_batch += N_rand
             if i_batch >= rays_rgb.shape[0]:
@@ -869,7 +887,7 @@ def train():
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', poses[i_test].shape)
             with torch.no_grad():
-                render_path(torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
+                render_path(torch.Tensor(poses[i_test]).to(device), render_frame_idxs, hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
             print('Saved test set')
 
 

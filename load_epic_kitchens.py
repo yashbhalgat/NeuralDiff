@@ -5,6 +5,7 @@ import imageio
 import json
 import torch.nn.functional as F
 import cv2
+import pdb
 
 from utils import get_bbox3d_for_epickitchens
 
@@ -44,13 +45,16 @@ def load_epic_kitchens_data(basedir, half_res=False):
 
     all_imgs = []
     all_poses = []
+    all_frame_idxs = []
     counts = [0]
     for s in splits:
         imgs = []
         poses = []
+        frame_indices = []
             
         for idx in metas['ids_'+s]:
             fname = os.path.join(basedir, "frames", metas['images'][str(idx)])
+            frame_indices.append(idx)
             imgs.append(imageio.imread(fname))
             poses.append(np.array(metas['poses'][str(idx)]))
         imgs = (np.array(imgs) / 255.).astype(np.float32) # keep all 4 channels (RGBA)
@@ -58,7 +62,9 @@ def load_epic_kitchens_data(basedir, half_res=False):
         counts.append(counts[-1] + imgs.shape[0])
         all_imgs.append(imgs)
         all_poses.append(poses)
-    
+        all_frame_idxs += frame_indices
+
+    all_frame_idxs = np.array(all_frame_idxs)    
     i_split = [np.arange(counts[i], counts[i+1]) for i in range(3)]
     
     imgs = np.concatenate(all_imgs, 0)
@@ -81,6 +87,9 @@ def load_epic_kitchens_data(basedir, half_res=False):
 
     near, far = min(metas["nears"].values()), max(metas["fars"].values())
 
-    bounding_box = get_bbox3d_for_epickitchens(metas, H, W, near=near, far=far)
+    xyz_bounding_box = get_bbox3d_for_epickitchens(metas, H, W, near=near, far=far)
+    min_time = torch.FloatTensor([min(all_frame_idxs)]).to(xyz_bounding_box[0].device)
+    max_time = torch.FloatTensor([max(all_frame_idxs)]).to(xyz_bounding_box[1].device)
+    xyzt_bounding_box = (torch.cat([xyz_bounding_box[0], min_time]), torch.cat([xyz_bounding_box[1], max_time]))
 
-    return imgs, poses, render_poses, [H, W, focal], i_split, bounding_box, [near, far]
+    return imgs, poses, render_poses, [H, W, focal], i_split, xyzt_bounding_box, [near, far], all_frame_idxs
