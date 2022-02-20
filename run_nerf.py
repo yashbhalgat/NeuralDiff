@@ -43,7 +43,7 @@ def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     embedded = embed_fn(inputs_flat)
 
     if viewdirs is not None:
-        input_dirs = viewdirs[:,None].expand(inputs.shape)
+        input_dirs = viewdirs[:,None].expand(list(inputs.shape[:-1]) + [viewdirs.shape[-1]])
         input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]])
         embedded_dirs = embeddirs_fn(input_dirs_flat)
         embedded = torch.cat([embedded, embedded_dirs], -1)
@@ -100,6 +100,8 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, time_coords=None, ndc=Tr
         if time_coords is None:
             pdb.set_trace()
             print("Alert! for single image case, time_coord should be provided")
+        time_coords = time_coords*torch.ones_like(rays_d[...,:1]).view(-1,1)
+        time_coords = time_coords[:,0]
     else:
         # use provided ray batch
         rays_o, rays_d, time_coords = rays
@@ -451,6 +453,7 @@ def render_rays(ray_batch,
 
         z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
         pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples + N_importance, 3]
+        pts = torch.cat([pts, time_coords[:,None].expand(pts.shape[:-1])[:,:,None]], dim=-1)
 
         run_fn = network_fn if network_fine is None else network_fine
 #         raw = run_network(pts, fn=run_fn)
@@ -582,7 +585,7 @@ def config_parser():
                         help='frequency of tensorboard image logging')
     parser.add_argument("--i_weights", type=int, default=10000, 
                         help='frequency of weight ckpt saving')
-    parser.add_argument("--i_testset", type=int, default=100, 
+    parser.add_argument("--i_testset", type=int, default=1000, 
                         help='frequency of testset saving')
     parser.add_argument("--i_video",   type=int, default=500000, 
                         help='frequency of render_poses video saving')
@@ -610,10 +613,12 @@ def train():
     if args.dataset_type=="epic_kitchens":
         images, poses, render_poses, hwf, i_split, bounding_box, near_far, all_frame_idxs = load_epic_kitchens_data(args.datadir)
         near, far = near_far
+        
         args.bounding_box = bounding_box
         print('Loaded llff', images.shape, hwf, args.datadir)
 
         i_train, i_val, i_test = i_split
+        render_frame_idxs = all_frame_idxs[i_test]
     
     else:
         print('Unknown dataset type', args.dataset_type, 'exiting')
@@ -817,17 +822,18 @@ def train():
        
         # add Total Variation loss
         if args.i_embed==1:
-            n_levels = render_kwargs_train["embed_fn"].n_levels
-            min_res = render_kwargs_train["embed_fn"].base_resolution
-            max_res = render_kwargs_train["embed_fn"].finest_resolution
-            log2_hashmap_size = render_kwargs_train["embed_fn"].log2_hashmap_size
-            TV_loss = sum(total_variation_loss(render_kwargs_train["embed_fn"].embeddings[i], \
-                                              min_res, max_res, \
-                                              i, log2_hashmap_size, \
-                                              n_levels=n_levels) for i in range(n_levels))
-            loss = loss + args.tv_loss_weight * TV_loss
-            if i>1000:
-                args.tv_loss_weight = 0.0
+            if args.tv_loss_weight > 0:
+                n_levels = render_kwargs_train["embed_fn"].n_levels
+                min_res = render_kwargs_train["embed_fn"].base_resolution
+                max_res = render_kwargs_train["embed_fn"].finest_resolution
+                log2_hashmap_size = render_kwargs_train["embed_fn"].log2_hashmap_size
+                TV_loss = sum(total_variation_loss(render_kwargs_train["embed_fn"].embeddings[i], \
+                                                min_res, max_res, \
+                                                i, log2_hashmap_size, \
+                                                n_levels=n_levels) for i in range(n_levels))
+                loss = loss + args.tv_loss_weight * TV_loss
+                if i>1000:
+                    args.tv_loss_weight = 0.0
  
         loss.backward()
         # pdb.set_trace()

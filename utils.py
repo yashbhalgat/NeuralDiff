@@ -144,9 +144,11 @@ def hash(coords, log2_hashmap_size):
     coords: XYZ+time coordinates. B x 4
     log2T:  logarithm of T w.r.t 2
     '''
+    if coords.shape[-1]==3:
+        pdb.set_trace()
     x, y, z, t = coords[..., 0], coords[..., 1], coords[..., 2], coords[..., 3]
     primes = [2654435761, 805459861, 3674653429, 2097192037]
-    return ((1<<log2_hashmap_size)-1) & (x*primes[0] ^ y*primes[1] ^ z*primes[2] ^ t*primes[3])
+    return torch.tensor((1<<log2_hashmap_size)-1) & (x*primes[0] ^ y*primes[1] ^ z*primes[2] ^ t*primes[3])
 
 
 def get_voxel_vertices(xyzt, bounding_box, resolution, log2_hashmap_size):
@@ -202,4 +204,4 @@ def get_bbox3d_for_epickitchens(metas, H, W, near, far):
             find_min_max(min_point)
             find_min_max(max_point)
 
-    return (torch.tensor(min_bound)-torch.tensor([1.0,1.0,1.0]), torch.tensor(max_bound)+torch.tensor([1.0,1.0,1.0]))
+    return (torch.tensor(min_bound)-torch.tensor([4.0,4.0,4.0]), torch.tensor(max_bound)+torch.tensor([4.0,4.0,4.0]))
