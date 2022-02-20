@@ -73,7 +73,7 @@ def load_epic_kitchens_data(basedir, half_res=False):
     H, W = imgs[0].shape[:2]
     focal = metas["intrinsics"][0][0]
     
-    render_poses = torch.stack([pose_spherical(angle, -30.0, 4.0) for angle in np.linspace(-180,180,40+1)[:-1]], 0)
+    # render_poses = torch.stack([pose_spherical(angle, -30.0, 4.0) for angle in np.linspace(-180,180,40+1)[:-1]], 0)
     
     if half_res:
         H = H//2
@@ -92,4 +92,4 @@ def load_epic_kitchens_data(basedir, half_res=False):
     max_time = torch.FloatTensor([max(all_frame_idxs)]).to(xyz_bounding_box[1].device)
     xyzt_bounding_box = (torch.cat([xyz_bounding_box[0], min_time]), torch.cat([xyz_bounding_box[1], max_time]))
 
-    return imgs, poses, render_poses, [H, W, focal], i_split, xyzt_bounding_box, [near, far], all_frame_idxs
+    return imgs, poses, [H, W, focal], i_split, xyzt_bounding_box, [near, far], all_frame_idxs

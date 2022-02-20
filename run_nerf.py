@@ -176,7 +176,7 @@ def render_path(render_poses, render_frame_idxs, hwf, K, chunk, render_kwargs, g
 
         if savedir is not None:
             rgb8 = to8b(rgbs[-1])
-            filename = os.path.join(savedir, '{:03d}.png'.format(i))
+            filename = os.path.join(savedir, '{:03d}.png'.format(int(render_frame_idxs[i])))
             imageio.imwrite(filename, rgb8)
 
 
@@ -543,6 +543,8 @@ def config_parser():
                         help='render the test set instead of render_poses path')
     parser.add_argument("--render_factor", type=int, default=0, 
                         help='downsampling factor to speed up rendering, set 4 or 8 for fast preview')
+    parser.add_argument("--render_fixed_viewpoint_video", action='store_true', 
+                        help='do not optimize, reload weights and render video from a fixed viewpoint')
 
     # training options
     parser.add_argument("--precrop_iters", type=int, default=0,
@@ -611,13 +613,14 @@ def train():
     K = None
 
     if args.dataset_type=="epic_kitchens":
-        images, poses, render_poses, hwf, i_split, bounding_box, near_far, all_frame_idxs = load_epic_kitchens_data(args.datadir)
+        images, poses, hwf, i_split, bounding_box, near_far, all_frame_idxs = load_epic_kitchens_data(args.datadir)
         near, far = near_far
         
         args.bounding_box = bounding_box
         print('Loaded llff', images.shape, hwf, args.datadir)
 
         i_train, i_val, i_test = i_split
+        render_poses = poses[i_test]
         render_frame_idxs = all_frame_idxs[i_test]
     
     else:
@@ -705,6 +708,21 @@ def train():
             imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
 
             return
+
+    if args.render_fixed_viewpoint_video:
+        print("RENDER from a Fixed View-point")
+        with torch.no_grad():
+            pose_idx = 2
+            fixed_pose = render_poses[pose_idx]
+            fixed_poses = fixed_pose.repeat(all_frame_idxs.shape[0], 1, 1) # repeat for number of frames
+            
+            videobase = os.path.join(basedir, expname, 'fixedviewpoint_{:04d}_{:06d}'.format(pose_idx, start))
+            os.makedirs(videobase, exist_ok=True)
+            
+            rgbs, _ = render_path(fixed_poses, np.sort(all_frame_idxs), hwf, K, args.chunk, render_kwargs_test, savedir=videobase)
+            print('Done, saving', rgbs.shape)
+            imageio.mimwrite(videobase + '_rgb.mp4', to8b(rgbs), fps=30, quality=8)
+            
 
     # Prepare raybatch tensor if batching random rays
     N_rand = args.N_rand
