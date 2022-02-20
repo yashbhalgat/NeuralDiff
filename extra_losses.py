@@ -19,9 +19,9 @@ def total_variation_loss(embeddings, min_resolution, max_resolution, level, log2
     cube_size = torch.floor(torch.clip(resolution/10.0, min_cube_size, max_cube_size)).int()
 
     # Sample cuboid
-    min_vertex = torch.randint(0, resolution-cube_size, (3,))
-    idx = min_vertex + torch.stack([torch.arange(cube_size+1) for _ in range(3)], dim=-1)
-    cube_indices = torch.stack(torch.meshgrid(idx[:,0], idx[:,1], idx[:,2]), dim=-1)
+    min_vertex = torch.randint(0, resolution-cube_size, (4,))
+    idx = min_vertex + torch.stack([torch.arange(cube_size+1) for _ in range(4)], dim=-1)
+    cube_indices = torch.stack(torch.meshgrid(idx[:,0], idx[:,1], idx[:,2], idx[:,3]), dim=-1)
 
     hashed_indices = hash(cube_indices, log2_hashmap_size)
     cube_embeddings = embeddings(hashed_indices)
@@ -29,8 +29,9 @@ def total_variation_loss(embeddings, min_resolution, max_resolution, level, log2
     tv_x = torch.pow(cube_embeddings[1:,:,:,:]-cube_embeddings[:-1,:,:,:], 2).sum()
     tv_y = torch.pow(cube_embeddings[:,1:,:,:]-cube_embeddings[:,:-1,:,:], 2).sum()
     tv_z = torch.pow(cube_embeddings[:,:,1:,:]-cube_embeddings[:,:,:-1,:], 2).sum()
+    tv_t = torch.pow(cube_embeddings[:,:,:,1:]-cube_embeddings[:,:,:,:-1], 2).sum()
 
-    return (tv_x + tv_y + tv_z)/cube_size
+    return (tv_x + tv_y + tv_z + tv_t)/cube_size
 
 
 def sigma_sparsity_loss(sigmas):
