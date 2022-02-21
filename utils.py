@@ -176,6 +176,32 @@ def get_voxel_vertices(xyzt, bounding_box, resolution, log2_hashmap_size):
     return voxel_min_vertex, voxel_max_vertex, hashed_voxel_indices
 
 
+def get_interval_vertices(t, bounding_range, resolution, log2_hashmap_size):
+    '''
+    t: 1D time coordinates of samples. B x 1
+    bounding_box: min and max t coordinates
+    resolution: number of intervals per axis
+    '''
+    range_min, range_max = bounding_range
+
+    if not torch.all(t <= range_max) or not torch.all(t >= range_min):
+        # print("ALERT: some points are outside bounding box. Clipping them!")
+        pdb.set_trace()
+        t = torch.clamp(t, min=range_min, max=range_max)
+
+    grid_size = (range_max-range_min)/resolution
+
+    left_idx = torch.floor((t-range_min)/grid_size).int() # B x 1
+    right_idx = left_idx + 1 # B x 1
+    interval_indices = torch.stack([left_idx, right_idx], dim=-1)
+    interval_min_vertex = left_idx*grid_size + range_min
+    interval_max_vertex = interval_min_vertex + torch.tensor([1.0])*grid_size
+
+    hashed_interval_indices = hash(interval_indices, log2_hashmap_size)
+
+    return interval_min_vertex, interval_max_vertex, hashed_interval_indices
+
+
 def get_bbox3d_for_epickitchens(metas, H, W, near, far):
     focal = metas["intrinsics"][0][0]
     poses = [torch.FloatTensor(metas["poses"][str(idx)]) for idx in metas["ids_train"]]

@@ -592,7 +592,7 @@ def config_parser():
     parser.add_argument("--i_video",   type=int, default=500000, 
                         help='frequency of render_poses video saving')
 
-    parser.add_argument("--finest_res",   type=int, default=512, 
+    parser.add_argument("--finest_res",   type=int, default=128, 
                         help='finest resolultion for hashed embedding')
     parser.add_argument("--log2_hashmap_size",   type=int, default=19, 
                         help='log2 of hashmap size')
@@ -722,6 +722,8 @@ def train():
             rgbs, _ = render_path(fixed_poses, np.sort(all_frame_idxs), hwf, K, args.chunk, render_kwargs_test, savedir=videobase)
             print('Done, saving', rgbs.shape)
             imageio.mimwrite(videobase + '_rgb.mp4', to8b(rgbs), fps=30, quality=8)
+
+            return
             
 
     # Prepare raybatch tensor if batching random rays
