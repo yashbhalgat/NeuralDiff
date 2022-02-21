@@ -75,7 +75,7 @@ class HashEmbedder(nn.Module):
 class Linear_HashEmbedder(nn.Module):
     def __init__(self, bounding_range, n_levels=4, n_features_per_level=2,\
                 log2_hashmap_size=11, base_resolution=16, finest_resolution=2048):
-        super(HashEmbedder, self).__init__()
+        super(Linear_HashEmbedder, self).__init__()
         self.bounding_range = bounding_range
         self.n_levels = n_levels
         self.n_features_per_level = n_features_per_level
@@ -102,9 +102,7 @@ class Linear_HashEmbedder(nn.Module):
         voxel_embedds: B x 2 x 2
         '''
         weight = (x - interval_min)/(interval_max-interval_min) # B x 1
-
-        c = interval_embedds[:,0]*(1-weight[:,None]) + interval_embedds[:,1]*weight[:,None]
-
+        c = interval_embedds[:,0]*(1-weight) + interval_embedds[:,1]*weight
         return c
 
     def forward(self, x):
@@ -118,7 +116,7 @@ class Linear_HashEmbedder(nn.Module):
  
             interval_embedds = self.embeddings[i](hashed_interval_indices)
 
-            x_embedded = self.trilinear_interp(x, interval_min_vertex, interval_max_vertex, interval_embedds)
+            x_embedded = self.linear_interp(x, interval_min_vertex, interval_max_vertex, interval_embedds)
             x_embedded_all.append(x_embedded)
 
         return torch.cat(x_embedded_all, dim=-1)
@@ -128,6 +126,13 @@ class XYZplusT_HashEmbedder(nn.Module):
     def __init__(self, bounding_box, n_levels=16, n_features_per_level=2,\
                 log2_hashmap_size=19, base_resolution=16, finest_resolution=512):
         super(XYZplusT_HashEmbedder, self).__init__()
+        self.bounding_box = bounding_box
+        self.n_levels = n_levels
+        self.base_resolution = torch.tensor(base_resolution)
+        self.finest_resolution = torch.tensor(finest_resolution)
+        self.b = torch.exp((torch.log(self.finest_resolution.float())-torch.log(self.base_resolution.float()))/(n_levels-1))
+        self.log2_hashmap_size = log2_hashmap_size
+
         xyz_bounding_box = bounding_box[0][:3], bounding_box[1][:3]
         t_bounding_range = bounding_box[0][3], bounding_box[1][3]
         self.xyz_embedder = HashEmbedder(xyz_bounding_box, finest_resolution=finest_resolution, 
@@ -136,7 +141,7 @@ class XYZplusT_HashEmbedder(nn.Module):
         self.out_dim = self.xyz_embedder.out_dim + self.t_embedder.out_dim
 
     def forward(self, xyzt):
-        xyz, t = xyzt[..., :3], xyzt[..., 3]
+        xyz, t = xyzt[..., :3], xyzt[..., 3].unsqueeze(-1)
         return torch.cat([self.xyz_embedder(xyz), self.t_embedder(t)], dim=-1)
 
 

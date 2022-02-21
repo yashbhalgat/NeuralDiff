@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-from hash_encoding import HashEmbedder, SHEncoder
+from hash_encoding import HashEmbedder, SHEncoder, XYZplusT_HashEmbedder
 
 # Misc
 img2mse = lambda x, y : torch.mean((x - y) ** 2)
@@ -63,7 +63,8 @@ def get_embedder(multires, args, i=0):
         embed = lambda x, eo=embedder_obj : eo.embed(x)
         out_dim = embedder_obj.out_dim
     elif i==1:
-        embed = HashEmbedder(bounding_box=args.bounding_box, \
+        # embed = HashEmbedder(bounding_box=args.bounding_box, \
+        embed = XYZplusT_HashEmbedder(bounding_box=args.bounding_box, \
                             log2_hashmap_size=args.log2_hashmap_size, \
                             finest_resolution=args.finest_res)
         out_dim = embed.out_dim

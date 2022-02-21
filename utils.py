@@ -136,19 +136,23 @@ def init_model(ckpt_path, dataset):
 #################################################################
 from ray_utils import get_rays, get_ray_directions, get_ndc_rays
 
-BOX_OFFSETS = torch.tensor([[[i,j,k,l] for i in [0, 1] for j in [0, 1] for k in [0, 1] for l in [0, 1]]],
+BOX_OFFSETS_3D = torch.tensor([[[i,j,k] for i in [0, 1] for j in [0, 1] for k in [0, 1]]],
+                               device='cuda')
+BOX_OFFSETS_4D = torch.tensor([[[i,j,k,l] for i in [0, 1] for j in [0, 1] for k in [0, 1] for l in [0, 1]]],
                                device='cuda')
 
 def hash(coords, log2_hashmap_size):
     '''
-    coords: XYZ+time coordinates. B x 4
+    coords: this function can process upto 7 dim coordinates
     log2T:  logarithm of T w.r.t 2
     '''
-    if coords.shape[-1]==3:
-        pdb.set_trace()
-    x, y, z, t = coords[..., 0], coords[..., 1], coords[..., 2], coords[..., 3]
-    primes = [2654435761, 805459861, 3674653429, 2097192037]
-    return torch.tensor((1<<log2_hashmap_size)-1) & (x*primes[0] ^ y*primes[1] ^ z*primes[2] ^ t*primes[3])
+    primes = [1, 2654435761, 805459861, 3674653429, 2097192037, 1434869437, 2165219737]
+    
+    xor_result = torch.zeros_like(coords)[..., 0]
+    for i in range(coords.shape[-1]):
+        xor_result ^= coords[..., i]*primes[i]
+
+    return torch.tensor((1<<log2_hashmap_size)-1) & xor_result
 
 
 def get_voxel_vertices(xyzt, bounding_box, resolution, log2_hashmap_size):
@@ -168,9 +172,13 @@ def get_voxel_vertices(xyzt, bounding_box, resolution, log2_hashmap_size):
 
     bottom_left_idx = torch.floor((xyzt-box_min)/grid_size).int()
     voxel_min_vertex = bottom_left_idx*grid_size + box_min
-    voxel_max_vertex = voxel_min_vertex + torch.tensor([1.0,1.0,1.0,1.0])*grid_size
+    voxel_max_vertex = voxel_min_vertex + torch.tensor([1.0 for _ in range(voxel_min_vertex.shape[-1])])*grid_size
 
-    voxel_indices = bottom_left_idx.unsqueeze(1) + BOX_OFFSETS
+    if xyzt.shape[-1]==3:
+        voxel_indices = bottom_left_idx.unsqueeze(1) + BOX_OFFSETS_3D
+    elif xyzt.shape[-1]==4:
+        voxel_indices = bottom_left_idx.unsqueeze(1) + BOX_OFFSETS_4D
+
     hashed_voxel_indices = hash(voxel_indices, log2_hashmap_size)
 
     return voxel_min_vertex, voxel_max_vertex, hashed_voxel_indices
@@ -193,7 +201,7 @@ def get_interval_vertices(t, bounding_range, resolution, log2_hashmap_size):
 
     left_idx = torch.floor((t-range_min)/grid_size).int() # B x 1
     right_idx = left_idx + 1 # B x 1
-    interval_indices = torch.stack([left_idx, right_idx], dim=-1)
+    interval_indices = torch.stack([left_idx, right_idx], dim=-2)
     interval_min_vertex = left_idx*grid_size + range_min
     interval_max_vertex = interval_min_vertex + torch.tensor([1.0])*grid_size
 
