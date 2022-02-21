@@ -204,7 +204,11 @@ def create_nerf(args):
     skips = [4]
     
     if args.i_embed==1:
-        model = NeRFSmall(num_layers=2,
+        if args.use_uncertainties:
+            model_class = NeRFSmallwithUncertainty
+        else:
+            model_class = NeRFSmall
+        model = model_class(num_layers=2,
                         hidden_dim=64,
                         geo_feat_dim=15,
                         num_layers_color=3,
@@ -223,7 +227,11 @@ def create_nerf(args):
 
     if args.N_importance > 0:
         if args.i_embed==1:
-            model_fine = NeRFSmall(num_layers=2,
+            if args.use_uncertainties:
+                model_class = NeRFSmallwithUncertainty
+            else:
+                model_class = NeRFSmall
+            model_fine = model_class(num_layers=2,
                         hidden_dim=64,
                         geo_feat_dim=15,
                         num_layers_color=3,
@@ -346,6 +354,11 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1]
     rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3]
 
+    uncertainty_map = None
+    if raw.shape[-1] > 4:
+        uncertainty = F.relu(raw[..., 4])
+        uncertainty_map = torch.sum(weights * uncertainty, -1)
+
     depth_map = torch.sum(weights * z_vals, -1)
     disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1))
     acc_map = torch.sum(weights, -1)
@@ -358,7 +371,7 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     entropy = Categorical(probs = weights+1e-5).entropy()
     sparsity_loss = entropy * mask
 
-    return rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss
+    return rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss, uncertainty_map
 
 
 def render_rays(ray_batch,
@@ -441,11 +454,11 @@ def render_rays(ray_batch,
 
 #     raw = run_network(pts)
     raw = network_query_fn(pts, viewdirs, network_fn)
-    rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
+    rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss, uncertainty_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
     if N_importance > 0:
 
-        rgb_map_0, disp_map_0, acc_map_0, sparsity_loss_0 = rgb_map, disp_map, acc_map, sparsity_loss
+        rgb_map_0, disp_map_0, acc_map_0, sparsity_loss_0, uncertainty_map_0 = rgb_map, disp_map, acc_map, sparsity_loss, uncertainty_map
 
         z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
         z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.), pytest=pytest)
@@ -459,9 +472,9 @@ def render_rays(ray_batch,
 #         raw = run_network(pts, fn=run_fn)
         raw = network_query_fn(pts, viewdirs, run_fn)
 
-        rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
+        rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss, uncertainty_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
-    ret = {'rgb_map' : rgb_map, 'disp_map' : disp_map, 'acc_map' : acc_map, 'sparsity_loss': sparsity_loss}
+    ret = {'rgb_map' : rgb_map, 'disp_map' : disp_map, 'acc_map' : acc_map, 'sparsity_loss': sparsity_loss, 'uncertainty_map': uncertainty_map}
     if retraw:
         ret['raw'] = raw
     if N_importance > 0:
@@ -469,6 +482,7 @@ def render_rays(ray_batch,
         ret['disp0'] = disp_map_0
         ret['acc0'] = acc_map_0
         ret['sparsity_loss0'] = sparsity_loss_0
+        ret['uncertainty_map0'] = uncertainty_map_0
         ret['z_std'] = torch.std(z_samples, dim=-1, unbiased=False)  # [N_rays]
 
     for k in ret:
@@ -600,6 +614,8 @@ def config_parser():
                         help='learning rate')
     parser.add_argument("--tv-loss-weight", type=float, default=1e-6,
                         help='learning rate')
+    parser.add_argument("--use-uncertainties", action='store_true', 
+                        help='use gaussian observation loss with uncertainty')
  
     return parser
 
@@ -656,6 +672,7 @@ def train():
     args.expname += "_fine"+str(args.finest_res) + "_log2T"+str(args.log2_hashmap_size)
     args.expname += "_lr"+str(args.lrate) + "_decay"+str(args.lrate_decay)
     args.expname += "_timebottleneck"
+    args.expname += "_withUncertainty"
     if args.sparse_loss_weight > 0:
         args.expname += "_sparse" + str(args.sparse_loss_weight)
     args.expname += "_TV" + str(args.tv_loss_weight)
@@ -827,13 +844,20 @@ def train():
                                                 **render_kwargs_train)
 
         optimizer.zero_grad()
-        img_loss = img2mse(rgb, target_s)
+        if extras['uncertainty_map'] is None:
+            img_loss = img2mse(rgb, target_s)
+        else:
+            img_loss = img2mse_with_uncertainty(rgb, target_s, extras['uncertainty_map'].unsqueeze(-1))
+
         trans = extras['raw'][...,-1]
         loss = img_loss
         psnr = mse2psnr(img_loss)
 
         if 'rgb0' in extras:
-            img_loss0 = img2mse(extras['rgb0'], target_s)
+            if extras['uncertainty_map0'] is None:
+                img_loss0 = img2mse(extras['rgb0'], target_s)
+            else:
+                img_loss0 = img2mse_with_uncertainty(extras['rgb0'], target_s, extras['uncertainty_map0'].unsqueeze(-1))
             loss = loss + img_loss0
             psnr0 = mse2psnr(img_loss0)
 
