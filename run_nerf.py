@@ -189,7 +189,7 @@ def render_path(render_poses, render_frame_idxs, hwf, K, chunk, render_kwargs, g
 def create_nerf(args):
     """Instantiate NeRF's MLP model.
     """
-    embed_fn, input_ch = get_embedder(args.multires, args, i=args.i_embed)
+    embed_fn, input_ch, time_dim = get_embedder(args.multires, args, i=args.i_embed)
     if args.i_embed==1:
         # hashed embedding table
         embedding_params = list(embed_fn.parameters())
@@ -198,7 +198,7 @@ def create_nerf(args):
     embeddirs_fn = None
     if args.use_viewdirs:
         # if using hashed for xyz, use SH for views
-        embeddirs_fn, input_ch_views = get_embedder(args.multires_views, args, i=args.i_embed_views)
+        embeddirs_fn, input_ch_views, _ = get_embedder(args.multires_views, args, i=args.i_embed_views)
     
     output_ch = 5 if args.N_importance > 0 else 4
     skips = [4]
@@ -207,13 +207,15 @@ def create_nerf(args):
         if args.use_uncertainties:
             model_class = NeRFSmallwithUncertainty
         else:
-            model_class = NeRFSmall
+            # model_class = NeRFSmall
+            model_class = BackgroundForegroundNeRF
         model = model_class(num_layers=2,
                         hidden_dim=64,
                         geo_feat_dim=15,
                         num_layers_color=3,
                         hidden_dim_color=64,
-                        input_ch=input_ch, input_ch_views=input_ch_views).to(device)
+                        input_ch=input_ch, input_ch_views=input_ch_views,
+                        time_dim=time_dim).to(device)
     else:
         model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
@@ -230,19 +232,21 @@ def create_nerf(args):
             if args.use_uncertainties:
                 model_class = NeRFSmallwithUncertainty
             else:
-                model_class = NeRFSmall
+                # model_class = NeRFSmall
+                model_class = BackgroundForegroundNeRF
             model_fine = model_class(num_layers=2,
                         hidden_dim=64,
                         geo_feat_dim=15,
                         num_layers_color=3,
                         hidden_dim_color=64,
-                        input_ch=input_ch, input_ch_views=input_ch_views).to(device)
+                        input_ch=input_ch, input_ch_views=input_ch_views,
+                        time_dim=time_dim).to(device)
         else:
             model_fine = NeRF(D=args.netdepth_fine, W=args.netwidth_fine,
                           input_ch=input_ch, output_ch=output_ch, skips=skips,
                           input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
         grad_vars += list(model_fine.parameters())
-
+    
     network_query_fn = lambda inputs, viewdirs, network_fn : run_network(inputs, viewdirs, network_fn,
                                                                 embed_fn=embed_fn,
                                                                 embeddirs_fn=embeddirs_fn,
@@ -474,7 +478,9 @@ def render_rays(ray_batch,
 
         rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss, uncertainty_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
-    ret = {'rgb_map' : rgb_map, 'disp_map' : disp_map, 'acc_map' : acc_map, 'sparsity_loss': sparsity_loss, 'uncertainty_map': uncertainty_map}
+    ret = {'rgb_map' : rgb_map, 'disp_map' : disp_map, 'acc_map' : acc_map, 'sparsity_loss': sparsity_loss}
+    if uncertainty_map is not None:
+        ret['uncertainty_map'] = uncertainty_map
     if retraw:
         ret['raw'] = raw
     if N_importance > 0:
@@ -482,7 +488,8 @@ def render_rays(ray_batch,
         ret['disp0'] = disp_map_0
         ret['acc0'] = acc_map_0
         ret['sparsity_loss0'] = sparsity_loss_0
-        ret['uncertainty_map0'] = uncertainty_map_0
+        if uncertainty_map_0 is not None:
+            ret['uncertainty_map0'] = uncertainty_map_0
         ret['z_std'] = torch.std(z_samples, dim=-1, unbiased=False)  # [N_rays]
 
     for k in ret:
@@ -671,7 +678,7 @@ def train():
         args.expname += "_posVIEW"
     args.expname += "_fine"+str(args.finest_res) + "_log2T"+str(args.log2_hashmap_size)
     args.expname += "_lr"+str(args.lrate) + "_decay"+str(args.lrate_decay)
-    args.expname += "_timebottleneck"
+    args.expname += "_BackgroundForeground"
     if args.use_uncertainties:
         args.expname += "_withUncertainty"
     if args.sparse_loss_weight > 0:
@@ -845,7 +852,7 @@ def train():
                                                 **render_kwargs_train)
 
         optimizer.zero_grad()
-        if extras['uncertainty_map'] is None:
+        if 'uncertainty_map' not in extras:
             img_loss = img2mse(rgb, target_s)
         else:
             img_loss = img2mse_with_uncertainty(rgb, target_s, extras['uncertainty_map'].unsqueeze(-1))
@@ -855,7 +862,7 @@ def train():
         psnr = mse2psnr(img_loss)
 
         if 'rgb0' in extras:
-            if extras['uncertainty_map0'] is None:
+            if 'uncertainty_map0' not in extras:
                 img_loss0 = img2mse(extras['rgb0'], target_s)
             else:
                 img_loss0 = img2mse_with_uncertainty(extras['rgb0'], target_s, extras['uncertainty_map0'].unsqueeze(-1))

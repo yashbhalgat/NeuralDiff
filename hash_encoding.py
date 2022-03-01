@@ -139,6 +139,7 @@ class XYZplusT_HashEmbedder(nn.Module):
                                          log2_hashmap_size=log2_hashmap_size)
         self.t_embedder = Linear_HashEmbedder(t_bounding_range)
         self.out_dim = self.xyz_embedder.out_dim + self.t_embedder.out_dim
+        self.time_dim = self.t_embedder.out_dim
 
     def forward(self, xyzt):
         xyz, t = xyzt[..., :3], xyzt[..., 3].unsqueeze(-1)
