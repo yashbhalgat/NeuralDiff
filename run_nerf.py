@@ -672,7 +672,8 @@ def train():
     args.expname += "_fine"+str(args.finest_res) + "_log2T"+str(args.log2_hashmap_size)
     args.expname += "_lr"+str(args.lrate) + "_decay"+str(args.lrate_decay)
     args.expname += "_timebottleneck"
-    args.expname += "_withUncertainty"
+    if args.use_uncertainties:
+        args.expname += "_withUncertainty"
     if args.sparse_loss_weight > 0:
         args.expname += "_sparse" + str(args.sparse_loss_weight)
     args.expname += "_TV" + str(args.tv_loss_weight)
