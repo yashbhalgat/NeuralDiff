@@ -86,7 +86,8 @@ def create_sigma_and_color_MLP(
     hidden_dim, hidden_dim_color,
     input_ch,
     input_ch_views,
-    geo_feat_dim
+    geo_feat_dim,
+    use_uncertainties
 ):
     # sigma network
     sigma_net = []
@@ -97,7 +98,10 @@ def create_sigma_and_color_MLP(
             in_dim = hidden_dim
         
         if l == num_layers - 1:
-            out_dim = 1 + geo_feat_dim # 1 sigma + 15 SH features for color
+            if use_uncertainties:
+                out_dim = 1 + 1 + geo_feat_dim # 1 sigma + 1 uncertainty + 15 SH features for color
+            else:
+                out_dim = 1 + geo_feat_dim # 1 sigma + 15 SH features for color
         else:
             out_dim = hidden_dim
         
@@ -377,7 +381,8 @@ class BackgroundForegroundNeRF(nn.Module):
                  num_layers_color=4,
                  hidden_dim_color=64,
                  input_ch=3, input_ch_views=3,
-                 time_dim=8
+                 time_dim=8,
+                 use_uncertainties=False
                  ):
         super(BackgroundForegroundNeRF, self).__init__()
 
@@ -390,6 +395,7 @@ class BackgroundForegroundNeRF(nn.Module):
         self.geo_feat_dim = geo_feat_dim
         self.num_layers_color = num_layers_color        
         self.hidden_dim_color = hidden_dim_color
+        self.use_uncertainties = use_uncertainties
 
         ### Background Network
         self.background_sigma_net, self.background_color_net = create_sigma_and_color_MLP(
@@ -397,7 +403,8 @@ class BackgroundForegroundNeRF(nn.Module):
                                                                     hidden_dim, hidden_dim_color,
                                                                     input_ch - time_dim, # only XYZ
                                                                     input_ch_views,
-                                                                    geo_feat_dim
+                                                                    geo_feat_dim,
+                                                                    use_uncertainties=False
                                                                )
 
         ### Foreground Network
@@ -406,10 +413,11 @@ class BackgroundForegroundNeRF(nn.Module):
                                                                     hidden_dim, hidden_dim_color,
                                                                     input_ch, # XYZ + time embedding
                                                                     input_ch_views,
-                                                                    geo_feat_dim
+                                                                    geo_feat_dim,
+                                                                    use_uncertainties=use_uncertainties
                                                                )
         
-    def forward_through_MLP(self, sigma_net, color_net, embedded_x, embedded_views):
+    def forward_through_MLP(self, sigma_net, color_net, embedded_x, embedded_views, use_uncertainties):
         # sigma
         h = embedded_x
         for l in range(self.num_layers):
@@ -417,7 +425,11 @@ class BackgroundForegroundNeRF(nn.Module):
             if l != self.num_layers - 1:
                 h = F.relu(h, inplace=True)
 
-        sigma, geo_feat = h[..., 0], h[..., 1:]
+        uncertainties = None
+        if use_uncertainties:
+            sigma, uncertainties, geo_feat = h[..., 0], h[..., 1], h[..., 2:]
+        else:
+            sigma, geo_feat = h[..., 0], h[..., 1:]
         
         # color
         h = torch.cat([embedded_views, geo_feat], dim=-1)
@@ -427,21 +439,32 @@ class BackgroundForegroundNeRF(nn.Module):
                 h = F.relu(h, inplace=True)
             
         color = h
-        return sigma, color
+        return sigma, color, uncertainties
 
     def forward(self, x):
         input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
         input_xyz, _ = input_pts[..., :-self.time_dim], input_pts[..., -self.time_dim:]
 
-        background_sigma, background_color = self.forward_through_MLP(self.background_sigma_net, self.background_color_net, input_xyz, input_views)
-        foreground_sigma, foreground_color = self.forward_through_MLP(self.foreground_sigma_net, self.foreground_color_net, input_pts, input_views)
+        background_sigma, background_color, _ = self.forward_through_MLP(self.background_sigma_net, self.background_color_net, \
+                                                                        input_xyz, input_views,
+                                                                        use_uncertainties=False)
+        foreground_sigma, foreground_color, foreground_uncertainties = self.forward_through_MLP( \
+                                                                        self.foreground_sigma_net, self.foreground_color_net, \
+                                                                        input_pts, input_views, \
+                                                                        use_uncertainties=self.use_uncertainties)
         background_sigma, foreground_sigma = F.relu(background_sigma), F.relu(foreground_sigma)
 
         # Principled color mixing
         sigma = background_sigma + foreground_sigma + 1e-9
         color = (background_sigma/sigma)[:,None] * background_color + (foreground_sigma/sigma)[:,None] * foreground_color
 
-        outputs = torch.cat([color, sigma.unsqueeze(dim=-1)], -1)
+        if foreground_uncertainties is not None:
+            outputs = torch.cat([color, \
+                                sigma.unsqueeze(dim=-1), \
+                                foreground_uncertainties.unsqueeze(dim=-1), \
+                                foreground_sigma.unsqueeze(dim=-1)], -1)
+        else:
+            outputs = torch.cat([color, sigma.unsqueeze(dim=-1)], -1)
         return outputs
 
 

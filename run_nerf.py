@@ -204,18 +204,19 @@ def create_nerf(args):
     skips = [4]
     
     if args.i_embed==1:
-        if args.use_uncertainties:
-            model_class = NeRFSmallwithUncertainty
-        else:
+        # if args.use_uncertainties:
+        #     model_class = NeRFSmallwithUncertainty
+        # else:
             # model_class = NeRFSmall
-            model_class = BackgroundForegroundNeRF
+        model_class = BackgroundForegroundNeRF
         model = model_class(num_layers=2,
                         hidden_dim=64,
                         geo_feat_dim=15,
                         num_layers_color=3,
                         hidden_dim_color=64,
                         input_ch=input_ch, input_ch_views=input_ch_views,
-                        time_dim=time_dim).to(device)
+                        time_dim=time_dim,
+                        use_uncertainties=args.use_uncertainties).to(device)
     else:
         model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
@@ -229,18 +230,19 @@ def create_nerf(args):
 
     if args.N_importance > 0:
         if args.i_embed==1:
-            if args.use_uncertainties:
-                model_class = NeRFSmallwithUncertainty
-            else:
+            # if args.use_uncertainties:
+            #     model_class = NeRFSmallwithUncertainty
+            # else:
                 # model_class = NeRFSmall
-                model_class = BackgroundForegroundNeRF
+            model_class = BackgroundForegroundNeRF
             model_fine = model_class(num_layers=2,
                         hidden_dim=64,
                         geo_feat_dim=15,
                         num_layers_color=3,
                         hidden_dim_color=64,
                         input_ch=input_ch, input_ch_views=input_ch_views,
-                        time_dim=time_dim).to(device)
+                        time_dim=time_dim,
+                        use_uncertainties=args.use_uncertainties).to(device)
         else:
             model_fine = NeRF(D=args.netdepth_fine, W=args.netwidth_fine,
                           input_ch=input_ch, output_ch=output_ch, skips=skips,
@@ -361,7 +363,12 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     uncertainty_map = None
     if raw.shape[-1] > 4:
         uncertainty = F.relu(raw[..., 4])
-        uncertainty_map = torch.sum(weights * uncertainty, -1)
+        if raw.shape[-1] > 5:
+            foreground_alpha = raw2alpha(raw[...,5] + noise, dists)
+            foreground_weights = foreground_alpha * torch.cumprod(torch.cat([torch.ones((foreground_alpha.shape[0], 1)), 1.-foreground_alpha + 1e-10], -1), -1)[:, :-1]
+            uncertainty_map = torch.sum(foreground_weights * uncertainty, -1)
+        else:
+            uncertainty_map = torch.sum(weights * uncertainty, -1)
 
     depth_map = torch.sum(weights * z_vals, -1)
     disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1))
