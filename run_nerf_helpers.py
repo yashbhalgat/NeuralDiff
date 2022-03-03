@@ -1,3 +1,4 @@
+from ast import If
 import torch
 # torch.autograd.set_detect_anomaly(True)
 import torch.nn as nn
@@ -12,7 +13,7 @@ img2mse = lambda x, y : torch.mean((x - y) ** 2)
 img2mse_with_uncertainty = lambda x, y, u : torch.mean(((x - y) ** 2)/(2*(u+1e-9)**2) + torch.log((u+1e-9)**2))
 mse2psnr = lambda x : -10. * torch.log(x) / torch.log(torch.Tensor([10.]))
 to8b = lambda x : (255*np.clip(x,0,1)).astype(np.uint8)
-
+relu_act = nn.Softplus()
 
 # Positional encoding (section 5.1)
 class Embedder:
@@ -178,36 +179,7 @@ class NeRF(nn.Module):
         else:
             outputs = self.output_linear(h)
 
-        return outputs    
-
-    def load_weights_from_keras(self, weights):
-        assert self.use_viewdirs, "Not implemented if use_viewdirs=False"
-        
-        # Load pts_linears
-        for i in range(self.D):
-            idx_pts_linears = 2 * i
-            self.pts_linears[i].weight.data = torch.from_numpy(np.transpose(weights[idx_pts_linears]))    
-            self.pts_linears[i].bias.data = torch.from_numpy(np.transpose(weights[idx_pts_linears+1]))
-        
-        # Load feature_linear
-        idx_feature_linear = 2 * self.D
-        self.feature_linear.weight.data = torch.from_numpy(np.transpose(weights[idx_feature_linear]))
-        self.feature_linear.bias.data = torch.from_numpy(np.transpose(weights[idx_feature_linear+1]))
-
-        # Load views_linears
-        idx_views_linears = 2 * self.D + 2
-        self.views_linears[0].weight.data = torch.from_numpy(np.transpose(weights[idx_views_linears]))
-        self.views_linears[0].bias.data = torch.from_numpy(np.transpose(weights[idx_views_linears+1]))
-
-        # Load rgb_linear
-        idx_rbg_linear = 2 * self.D + 4
-        self.rgb_linear.weight.data = torch.from_numpy(np.transpose(weights[idx_rbg_linear]))
-        self.rgb_linear.bias.data = torch.from_numpy(np.transpose(weights[idx_rbg_linear+1]))
-
-        # Load alpha_linear
-        idx_alpha_linear = 2 * self.D + 6
-        self.alpha_linear.weight.data = torch.from_numpy(np.transpose(weights[idx_alpha_linear]))
-        self.alpha_linear.bias.data = torch.from_numpy(np.transpose(weights[idx_alpha_linear+1]))
+        return outputs
 
 
 # Small NeRF for Hash embeddings
@@ -219,52 +191,27 @@ class NeRFSmall(nn.Module):
                  num_layers_color=4,
                  hidden_dim_color=64,
                  input_ch=3, input_ch_views=3,
+                 use_uncertainties=False
                  ):
         super(NeRFSmall, self).__init__()
 
         self.input_ch = input_ch
         self.input_ch_views = input_ch_views
+        self.use_uncertainties = use_uncertainties
 
         # sigma network
         self.num_layers = num_layers
         self.hidden_dim = hidden_dim
         self.geo_feat_dim = geo_feat_dim
 
-        sigma_net = []
-        for l in range(num_layers):
-            if l == 0:
-                in_dim = self.input_ch
-            else:
-                in_dim = hidden_dim
-            
-            if l == num_layers - 1:
-                out_dim = 1 + self.geo_feat_dim # 1 sigma + 15 SH features for color
-            else:
-                out_dim = hidden_dim
-            
-            sigma_net.append(nn.Linear(in_dim, out_dim, bias=False))
-
-        self.sigma_net = nn.ModuleList(sigma_net)
-
-        # color network
-        self.num_layers_color = num_layers_color        
-        self.hidden_dim_color = hidden_dim_color
-        
-        color_net =  []
-        for l in range(num_layers_color):
-            if l == 0:
-                in_dim = self.input_ch_views + self.geo_feat_dim
-            else:
-                in_dim = hidden_dim
-            
-            if l == num_layers_color - 1:
-                out_dim = 3 # 3 rgb
-            else:
-                out_dim = hidden_dim
-            
-            color_net.append(nn.Linear(in_dim, out_dim, bias=False))
-
-        self.color_net = nn.ModuleList(color_net)
+        self.sigma_net, self.color_net = create_sigma_and_color_MLP(
+                                            num_layers, num_layers_color,
+                                            hidden_dim, hidden_dim_color,
+                                            input_ch,
+                                            input_ch_views,
+                                            geo_feat_dim,
+                                            use_uncertainties
+                                         )
     
     def forward(self, x):
         input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
@@ -276,8 +223,14 @@ class NeRFSmall(nn.Module):
             if l != self.num_layers - 1:
                 h = F.relu(h, inplace=True)
 
-        sigma, geo_feat = h[..., 0], h[..., 1:]
-        
+        uncertainties = None
+        if self.use_uncertainties:
+            sigma, uncertainties, geo_feat = h[..., 0], h[..., 1], h[..., 1:]
+            uncertainties = relu_act(uncertainties)
+        else:
+            sigma, geo_feat = h[..., 0], h[..., 1:]
+        sigma = relu_act(sigma)
+
         # color
         h = torch.cat([input_views, geo_feat], dim=-1)
         for l in range(self.num_layers_color):
@@ -285,90 +238,11 @@ class NeRFSmall(nn.Module):
             if l != self.num_layers_color - 1:
                 h = F.relu(h, inplace=True)
             
-        # color = torch.sigmoid(h)
         color = h
-        outputs = torch.cat([color, sigma.unsqueeze(dim=-1)], -1)
-
-        return outputs
-
-
-class NeRFSmallwithUncertainty(nn.Module):
-    def __init__(self,
-                 num_layers=3,
-                 hidden_dim=64,
-                 geo_feat_dim=15,
-                 num_layers_color=4,
-                 hidden_dim_color=64,
-                 input_ch=3, input_ch_views=3,
-                 ):
-        super(NeRFSmallwithUncertainty, self).__init__()
-
-        self.input_ch = input_ch
-        self.input_ch_views = input_ch_views
-
-        # sigma network
-        self.num_layers = num_layers
-        self.hidden_dim = hidden_dim
-        self.geo_feat_dim = geo_feat_dim
-
-        sigma_net = []
-        for l in range(num_layers):
-            if l == 0:
-                in_dim = self.input_ch
-            else:
-                in_dim = hidden_dim
-            
-            if l == num_layers - 1:
-                out_dim = 1 + 1 + self.geo_feat_dim # 1 sigma + 1 uncertainty + 15 SH features for color
-            else:
-                out_dim = hidden_dim
-            
-            sigma_net.append(nn.Linear(in_dim, out_dim, bias=False))
-
-        self.sigma_net = nn.ModuleList(sigma_net)
-
-        # color network
-        self.num_layers_color = num_layers_color        
-        self.hidden_dim_color = hidden_dim_color
-        
-        color_net =  []
-        for l in range(num_layers_color):
-            if l == 0:
-                in_dim = self.input_ch_views + self.geo_feat_dim
-            else:
-                in_dim = hidden_dim
-            
-            if l == num_layers_color - 1:
-                out_dim = 3 # 3 rgb
-            else:
-                out_dim = hidden_dim
-            
-            color_net.append(nn.Linear(in_dim, out_dim, bias=False))
-
-        self.color_net = nn.ModuleList(color_net)
-    
-    def forward(self, x):
-        input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
-
-        # sigma
-        h = input_pts
-        for l in range(self.num_layers):
-            h = self.sigma_net[l](h)
-            if l != self.num_layers - 1:
-                h = F.relu(h, inplace=True)
-
-        sigma, uncertainty, geo_feat = h[..., 0], h[..., 1], h[..., 2:]
-        
-        # color
-        h = torch.cat([input_views, geo_feat], dim=-1)
-        for l in range(self.num_layers_color):
-            h = self.color_net[l](h)
-            if l != self.num_layers_color - 1:
-                h = F.relu(h, inplace=True)
-            
-        # color = torch.sigmoid(h)
-        color = h
-        outputs = torch.cat([color, sigma.unsqueeze(dim=-1), uncertainty.unsqueeze(dim=-1)], -1)
+        if uncertainties is not None:
+            outputs = torch.cat([color, sigma.unsqueeze(dim=-1), uncertainties.unsqueeze(dim=-1)], -1)
+        else:
+            outputs = torch.cat([color, sigma.unsqueeze(dim=-1)], -1)
 
         return outputs
 
@@ -382,7 +256,8 @@ class BackgroundForegroundNeRF(nn.Module):
                  hidden_dim_color=64,
                  input_ch=3, input_ch_views=3,
                  time_dim=8,
-                 use_uncertainties=False
+                 use_uncertainties=False,
+                 only_background=False # we will rarely use this option
                  ):
         super(BackgroundForegroundNeRF, self).__init__()
 
@@ -396,6 +271,7 @@ class BackgroundForegroundNeRF(nn.Module):
         self.num_layers_color = num_layers_color        
         self.hidden_dim_color = hidden_dim_color
         self.use_uncertainties = use_uncertainties
+        self.only_background = only_background
 
         ### Background Network
         self.background_sigma_net, self.background_color_net = create_sigma_and_color_MLP(
@@ -404,7 +280,7 @@ class BackgroundForegroundNeRF(nn.Module):
                                                                     input_ch - time_dim, # only XYZ
                                                                     input_ch_views,
                                                                     geo_feat_dim,
-                                                                    use_uncertainties=False
+                                                                    use_uncertainties=use_uncertainties if only_background else False
                                                                )
 
         ### Foreground Network
@@ -428,9 +304,11 @@ class BackgroundForegroundNeRF(nn.Module):
         uncertainties = None
         if use_uncertainties:
             sigma, uncertainties, geo_feat = h[..., 0], h[..., 1], h[..., 2:]
+            uncertainties = relu_act(uncertainties)
         else:
             sigma, geo_feat = h[..., 0], h[..., 1:]
-        
+        sigma = relu_act(sigma)
+
         # color
         h = torch.cat([embedded_views, geo_feat], dim=-1)
         for l in range(self.num_layers_color):
@@ -445,27 +323,41 @@ class BackgroundForegroundNeRF(nn.Module):
         input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
         input_xyz, _ = input_pts[..., :-self.time_dim], input_pts[..., -self.time_dim:]
 
-        background_sigma, background_color, _ = self.forward_through_MLP(self.background_sigma_net, self.background_color_net, \
+        if not self.only_background:
+            background_sigma, background_color, _ = self.forward_through_MLP(self.background_sigma_net, self.background_color_net, \
                                                                         input_xyz, input_views,
                                                                         use_uncertainties=False)
-        foreground_sigma, foreground_color, foreground_uncertainties = self.forward_through_MLP( \
-                                                                        self.foreground_sigma_net, self.foreground_color_net, \
-                                                                        input_pts, input_views, \
+            foreground_sigma, foreground_color, foreground_uncertainties = self.forward_through_MLP( \
+                                                                            self.foreground_sigma_net, self.foreground_color_net, \
+                                                                            input_pts, input_views, \
+                                                                            use_uncertainties=self.use_uncertainties)
+        else:
+            background_sigma, background_color, background_uncertainties = self.forward_through_MLP(self.background_sigma_net, self.background_color_net, \
+                                                                        input_xyz, input_views,
                                                                         use_uncertainties=self.use_uncertainties)
-        background_sigma, foreground_sigma = F.relu(background_sigma), F.relu(foreground_sigma)
+            # dummies for foreground
+            foreground_sigma, foreground_color, foreground_uncertainties = torch.zeros_like(background_sigma), torch.zeros_like(background_color), None
 
         # Principled color mixing
         sigma = background_sigma + foreground_sigma + 1e-9
         color = (background_sigma/sigma)[:,None] * background_color + (foreground_sigma/sigma)[:,None] * foreground_color
 
-        if foreground_uncertainties is not None:
-            outputs = torch.cat([color, \
+        if self.only_background:
+            if background_uncertainties is not None:
+                return torch.cat([color, \
                                 sigma.unsqueeze(dim=-1), \
-                                foreground_uncertainties.unsqueeze(dim=-1), \
-                                foreground_sigma.unsqueeze(dim=-1)], -1)
-        else:
-            outputs = torch.cat([color, sigma.unsqueeze(dim=-1)], -1)
-        return outputs
+                                background_uncertainties.unsqueeze(dim=-1)], -1)
+            else:
+                return torch.cat([color, sigma.unsqueeze(dim=-1)], -1)
+
+        if not self.only_background:
+            if foreground_uncertainties is not None:
+                return torch.cat([color, \
+                                    sigma.unsqueeze(dim=-1), \
+                                    foreground_uncertainties.unsqueeze(dim=-1), \
+                                    foreground_sigma.unsqueeze(dim=-1)], -1)
+            else:
+                return torch.cat([color, sigma.unsqueeze(dim=-1)], -1)
 
 
 # Ray helpers

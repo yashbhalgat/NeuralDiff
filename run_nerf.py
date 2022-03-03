@@ -1,3 +1,4 @@
+import math
 import os, sys
 from datetime import datetime
 import numpy as np
@@ -157,14 +158,20 @@ def render_path(render_poses, render_frame_idxs, hwf, K, chunk, render_kwargs, g
 
     rgbs = []
     disps = []
+    uncertainty_maps = []
 
     t = time.time()
     for i, c2w in enumerate(tqdm(render_poses)):
         print(i, time.time() - t)
         t = time.time()
-        rgb, disp, acc, _ = render(H, W, K, chunk=chunk, c2w=c2w[:3,:4], time_coords=render_frame_idxs[i], **render_kwargs)
+        rgb, disp, _, extras = render(H, W, K, chunk=chunk, c2w=c2w[:3,:4], time_coords=render_frame_idxs[i], **render_kwargs)
         rgbs.append(rgb.cpu().numpy())
         disps.append(disp.cpu().numpy())
+        if 'uncertainty_map' in extras:
+            uncertainty_map = extras['uncertainty_map'].cpu().numpy()
+            uncertainty_map = (uncertainty_map - np.min(uncertainty_map)) / (np.max(uncertainty_map)-np.min(uncertainty_map))
+            uncertainty_maps.append(uncertainty_map)
+
         if i==0:
             print(rgb.shape, disp.shape)
 
@@ -179,11 +186,18 @@ def render_path(render_poses, render_frame_idxs, hwf, K, chunk, render_kwargs, g
             filename = os.path.join(savedir, '{:03d}.png'.format(int(render_frame_idxs[i])))
             imageio.imwrite(filename, rgb8)
 
+            if 'uncertainty_map' in extras:
+                uncertainty_filename = os.path.join(savedir, '{:03d}_uncertainty.png'.format(int(render_frame_idxs[i])))
+                uncertainty_map = to8b(uncertainty_maps[-1])
+                imageio.imwrite(uncertainty_filename, uncertainty_map)
+
 
     rgbs = np.stack(rgbs, 0)
     disps = np.stack(disps, 0)
+    if uncertainty_maps:
+        uncertainty_maps = np.stack(uncertainty_maps, 0)
 
-    return rgbs, disps
+    return rgbs, disps, uncertainty_maps
 
 
 def create_nerf(args):
@@ -216,7 +230,8 @@ def create_nerf(args):
                         hidden_dim_color=64,
                         input_ch=input_ch, input_ch_views=input_ch_views,
                         time_dim=time_dim,
-                        use_uncertainties=args.use_uncertainties).to(device)
+                        use_uncertainties=args.use_uncertainties,
+                        only_background=args.only_background).to(device)
     else:
         model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
@@ -224,10 +239,6 @@ def create_nerf(args):
     grad_vars = list(model.parameters())
 
     model_fine = None
-
-    # if args.i_embed==1:
-    #     args.N_importance = 0
-
     if args.N_importance > 0:
         if args.i_embed==1:
             # if args.use_uncertainties:
@@ -242,7 +253,8 @@ def create_nerf(args):
                         hidden_dim_color=64,
                         input_ch=input_ch, input_ch_views=input_ch_views,
                         time_dim=time_dim,
-                        use_uncertainties=args.use_uncertainties).to(device)
+                        use_uncertainties=args.use_uncertainties,
+                        only_background=args.only_background).to(device)
         else:
             model_fine = NeRF(D=args.netdepth_fine, W=args.netwidth_fine,
                           input_ch=input_ch, output_ch=output_ch, skips=skips,
@@ -323,6 +335,12 @@ def create_nerf(args):
     return render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer
 
 
+def get_weights_from_sigmas(sigmas, dists, noise=0.0):
+    alpha = 1.-torch.exp(-F.relu(sigmas + noise)*dists)
+    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1]
+    return weights
+
+
 def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False):
     """Transforms model's predictions to semantically meaningful values.
     Args:
@@ -354,18 +372,14 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
             noise = np.random.rand(*list(raw[...,3].shape)) * raw_noise_std
             noise = torch.Tensor(noise)
 
-    # sigma_loss = sigma_sparsity_loss(raw[...,3])
-    alpha = raw2alpha(raw[...,3] + noise, dists)  # [N_rays, N_samples]
-    # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
-    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1]
+    weights = get_weights_from_sigmas(raw[...,3], dists, noise)
     rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3]
 
     uncertainty_map = None
     if raw.shape[-1] > 4:
         uncertainty = F.relu(raw[..., 4])
         if raw.shape[-1] > 5:
-            foreground_alpha = raw2alpha(raw[...,5] + noise, dists)
-            foreground_weights = foreground_alpha * torch.cumprod(torch.cat([torch.ones((foreground_alpha.shape[0], 1)), 1.-foreground_alpha + 1e-10], -1), -1)[:, :-1]
+            foreground_weights = get_weights_from_sigmas(raw[...,5], dists, noise)
             uncertainty_map = torch.sum(foreground_weights * uncertainty, -1)
         else:
             uncertainty_map = torch.sum(weights * uncertainty, -1)
@@ -630,6 +644,10 @@ def config_parser():
                         help='learning rate')
     parser.add_argument("--use-uncertainties", action='store_true', 
                         help='use gaussian observation loss with uncertainty')
+    parser.add_argument("--only-background", action='store_true', 
+                        help='train only the static/background model')
+    parser.add_argument("--only-foreground", action='store_true', 
+                        help='train only the dynamic/foreground model')
  
     return parser
 
@@ -688,6 +706,8 @@ def train():
     args.expname += "_BackgroundForeground"
     if args.use_uncertainties:
         args.expname += "_withUncertainty"
+    if args.only_background:
+        args.expname += "_STATIC"
     if args.sparse_loss_weight > 0:
         args.expname += "_sparse" + str(args.sparse_loss_weight)
     args.expname += "_TV" + str(args.tv_loss_weight)
@@ -735,9 +755,11 @@ def train():
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', render_poses.shape)
 
-            rgbs, _ = render_path(render_poses, render_frame_idxs, hwf, K, args.chunk, render_kwargs_test, gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
+            rgbs, _, uncertainty_maps = render_path(render_poses, render_frame_idxs, hwf, K, args.chunk, render_kwargs_test, gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
             print('Done rendering', testsavedir)
             imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
+            if len(uncertainty_maps)>0:
+                imageio.mimwrite(os.path.join(testsavedir, 'uncertainty_video.mp4'), to8b(uncertainty_maps), fps=30, quality=8)
 
             return
 
@@ -751,9 +773,11 @@ def train():
             videobase = os.path.join(basedir, expname, 'fixedviewpoint_{:04d}_{:06d}'.format(pose_idx, start))
             os.makedirs(videobase, exist_ok=True)
             
-            rgbs, _ = render_path(fixed_poses, np.sort(all_frame_idxs), hwf, K, args.chunk, render_kwargs_test, savedir=videobase)
+            rgbs, _, uncertainty_maps = render_path(fixed_poses, np.sort(all_frame_idxs), hwf, K, args.chunk, render_kwargs_test, savedir=videobase)
             print('Done, saving', rgbs.shape)
             imageio.mimwrite(videobase + '_rgb.mp4', to8b(rgbs), fps=30, quality=8)
+            if len(uncertainty_maps)>0:
+                imageio.mimwrite(videobase + '_uncertainties.mp4', to8b(uncertainty_maps), fps=30, quality=8)
 
             return
             
@@ -791,7 +815,9 @@ def train():
         rays_rgb = torch.Tensor(rays_rgb).to(device)
 
 
-    N_iters = 50000 + 1
+    N_iters = int(50000 * 1024/args.N_rand) + 1
+    args.lrate = args.lrate * math.sqrt(args.N_rand/1024.0)
+
     print('Begin')
     print('TRAIN views are', i_train)
     print('TEST views are', i_test)
@@ -934,11 +960,13 @@ def train():
         if i%args.i_video==0 and i > 0:
             # Turn on testing mode
             with torch.no_grad():
-                rgbs, disps = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test)
+                rgbs, disps, uncertainty_maps = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test)
             print('Done, saving', rgbs.shape, disps.shape)
             moviebase = os.path.join(basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
             imageio.mimwrite(moviebase + 'rgb.mp4', to8b(rgbs), fps=30, quality=8)
             imageio.mimwrite(moviebase + 'disp.mp4', to8b(disps / np.max(disps)), fps=30, quality=8)
+            if len(uncertainty_maps)>0:
+                imageio.mimwrite(moviebase + 'uncertainties.mp4', to8b(uncertainty_maps), fps=30, quality=8)
 
             # if args.use_viewdirs:
             #     render_kwargs_test['c2w_staticcam'] = render_poses[0][:3,:4]
