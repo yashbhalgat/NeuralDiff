@@ -37,17 +37,24 @@ def batchify(fn, chunk):
     return ret
 
 
-def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
+def run_network(inputs, inputs_cam, viewdirs, viewdirs_cam, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     """Prepares inputs and applies network 'fn'.
     """
     inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
     embedded = embed_fn(inputs_flat)
+    inputs_cam_flat = torch.reshape(inputs_cam, [-1, inputs_cam.shape[-1]])
+    embedded_cam = embed_fn(inputs_cam_flat)
+    embedded = torch.cat([embedded, embedded_cam], -1)
 
     if viewdirs is not None:
         input_dirs = viewdirs[:,None].expand(list(inputs.shape[:-1]) + [viewdirs.shape[-1]])
         input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]])
         embedded_dirs = embeddirs_fn(input_dirs_flat)
-        embedded = torch.cat([embedded, embedded_dirs], -1)
+        
+        input_dirs_cam = viewdirs_cam[:,None].expand(list(inputs.shape[:-1]) + [viewdirs_cam.shape[-1]])
+        input_dirs_cam_flat = torch.reshape(input_dirs_cam, [-1, input_dirs_cam.shape[-1]])
+        embedded_dirs_cam = embeddirs_fn(input_dirs_cam_flat)
+        embedded = torch.cat([embedded, embedded_dirs, embedded_dirs_cam], -1)
 
     outputs_flat = batchify(fn, netchunk)(embedded)
     outputs = torch.reshape(outputs_flat, list(inputs.shape[:-1]) + [outputs_flat.shape[-1]])
@@ -98,6 +105,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, time_coords=None, ndc=Tr
     if c2w is not None:
         # special case to render full image
         rays_o, rays_d = get_rays(H, W, K, c2w)
+        rays_o_cam, rays_d_cam = get_rays_incameraframe(H, W, K)
         if time_coords is None:
             pdb.set_trace()
             print("Alert! for single image case, time_coord should be provided")
@@ -105,19 +113,21 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, time_coords=None, ndc=Tr
         time_coords = time_coords[:,0]
     else:
         # use provided ray batch
-        rays_o, rays_d, time_coords = rays
+        rays_o, rays_d, rays_o_cam, rays_d_cam, time_coords = rays
         time_coords = time_coords[:,0]
 
     if use_viewdirs:
         # provide ray directions as input
         viewdirs = rays_d
-        if c2w_staticcam is not None:
-            # special case to visualize effect of viewdirs
-            rays_o, rays_d = get_rays(H, W, K, c2w_staticcam)
         viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True)
         viewdirs = torch.reshape(viewdirs, [-1,3]).float()
 
+        viewdirs_cam = rays_d_cam
+        viewdirs_cam = viewdirs_cam / torch.norm(viewdirs_cam, dim=-1, keepdim=True)
+        viewdirs_cam = torch.reshape(viewdirs_cam, [-1,3]).float()
+
     sh = rays_d.shape # [..., 3]
+    ### Note: ignoring NDC for now...
     if ndc:
         # for forward facing scenes
         rays_o, rays_d = ndc_rays(H, W, K[0][0], 1., rays_o, rays_d)
@@ -125,11 +135,13 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, time_coords=None, ndc=Tr
     # Create ray batch
     rays_o = torch.reshape(rays_o, [-1,3]).float()
     rays_d = torch.reshape(rays_d, [-1,3]).float()
+    rays_o_cam = torch.reshape(rays_o_cam, [-1,3]).float()
+    rays_d_cam = torch.reshape(rays_d_cam, [-1,3]).float()
 
     near, far = near * torch.ones_like(rays_d[...,:1]), far * torch.ones_like(rays_d[...,:1])
-    rays = torch.cat([rays_o, rays_d, near, far], -1)
+    rays = torch.cat([rays_o, rays_d, rays_o_cam, rays_d_cam, near, far], -1)
     if use_viewdirs:
-        rays = torch.cat([rays, viewdirs], -1)
+        rays = torch.cat([rays, viewdirs, viewdirs_cam], -1)
 
     # Attach time coordinates
     rays = torch.cat([rays, time_coords[:,None]], -1)
@@ -206,7 +218,12 @@ def create_nerf(args):
     embed_fn, input_ch, time_dim = get_embedder(args.multires, args, i=args.i_embed)
     if args.i_embed==1:
         # hashed embedding table
-        embedding_params = list(embed_fn.parameters())
+        if not args.only_foreground:
+            embedding_params = list(embed_fn.parameters())
+        else:
+            for param in embed_fn.xyz_embedder.parameters():
+                param.requires_grad = False
+            embedding_params = list(embed_fn.t_embedder.parameters())
 
     input_ch_views = 0
     embeddirs_fn = None
@@ -218,50 +235,72 @@ def create_nerf(args):
     skips = [4]
     
     if args.i_embed==1:
-        # if args.use_uncertainties:
-        #     model_class = NeRFSmallwithUncertainty
-        # else:
-            # model_class = NeRFSmall
-        model_class = BackgroundForegroundNeRF
+        model_class = BackgroundForegroundActorNeRF_separateEmbeddings
         model = model_class(num_layers=2,
                         hidden_dim=64,
                         geo_feat_dim=15,
                         num_layers_color=3,
                         hidden_dim_color=64,
-                        input_ch=input_ch, input_ch_views=input_ch_views,
-                        time_dim=time_dim,
+                        input_ch=input_ch, input_cam_ch=input_ch,
+                        input_ch_views=input_ch_views, input_ch_views_cam=input_ch_views,
+                        # time_dim=time_dim,
                         use_uncertainties=args.use_uncertainties,
-                        only_background=args.only_background).to(device)
+                        only_background=args.only_background,
+                        args=args).to(device)
+        if args.only_foreground:
+            ### Making sure the initial sigma outputs are zero
+            for name, param in model.foreground_sigma_net.named_parameters():
+                if 'weight' in name or 'bias' in name:
+                    param.data.zero_()
     else:
         model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
                  input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
-    grad_vars = list(model.parameters())
+
+    if not args.only_foreground:
+        grad_vars = list(model.parameters())
+    else:
+        for param in model.background_sigma_net.parameters():
+            param.requires_grad = False
+        for param in model.background_color_net.parameters():
+            param.requires_grad = False
+        grad_vars = list(model.foreground_sigma_net.parameters())+list(model.foreground_color_net.parameters())
 
     model_fine = None
     if args.N_importance > 0:
         if args.i_embed==1:
-            # if args.use_uncertainties:
-            #     model_class = NeRFSmallwithUncertainty
-            # else:
-                # model_class = NeRFSmall
-            model_class = BackgroundForegroundNeRF
+            model_class = BackgroundForegroundActorNeRF_separateEmbeddings
             model_fine = model_class(num_layers=2,
                         hidden_dim=64,
                         geo_feat_dim=15,
                         num_layers_color=3,
                         hidden_dim_color=64,
-                        input_ch=input_ch, input_ch_views=input_ch_views,
-                        time_dim=time_dim,
+                        input_ch=input_ch, input_cam_ch=input_ch,
+                        input_ch_views=input_ch_views, input_ch_views_cam=input_ch_views,
+                        # time_dim=time_dim,
                         use_uncertainties=args.use_uncertainties,
-                        only_background=args.only_background).to(device)
+                        only_background=args.only_background,
+                        args=args).to(device)
+            if args.only_foreground:
+                ### Making sure the initial sigma outputs are zero
+                for name, param in model_fine.foreground_sigma_net.named_parameters():
+                    if 'weight' in name or 'bias' in name:
+                        param.data.zero_()
         else:
             model_fine = NeRF(D=args.netdepth_fine, W=args.netwidth_fine,
                           input_ch=input_ch, output_ch=output_ch, skips=skips,
                           input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
-        grad_vars += list(model_fine.parameters())
-    
-    network_query_fn = lambda inputs, viewdirs, network_fn : run_network(inputs, viewdirs, network_fn,
+
+        if not args.only_foreground:
+            grad_vars += list(model_fine.parameters())
+        else:
+            for param in model_fine.background_sigma_net.parameters():
+                param.requires_grad = False
+            for param in model_fine.background_color_net.parameters():
+                param.requires_grad = False
+            grad_vars += list(model_fine.foreground_sigma_net.parameters())+list(model_fine.foreground_color_net.parameters())
+
+    network_query_fn = lambda inputs, inputs_cam, viewdirs, viewdirs_cam, network_fn : run_network(inputs, inputs_cam, viewdirs, viewdirs_cam, network_fn,
                                                                 embed_fn=embed_fn,
                                                                 embeddirs_fn=embeddirs_fn,
                                                                 netchunk=args.netchunk)
@@ -297,7 +336,8 @@ def create_nerf(args):
         ckpt = torch.load(ckpt_path)
 
         start = ckpt['global_step']
-        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        if not args.only_foreground:
+            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
 
         # Load model
         model.load_state_dict(ckpt['network_fn_state_dict'])
@@ -354,8 +394,6 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
         weights: [num_rays, num_samples]. Weights assigned to each sampled color.
         depth_map: [num_rays]. Estimated distance to object.
     """
-    raw2alpha = lambda raw, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(raw)*dists)
-
     dists = z_vals[...,1:] - z_vals[...,:-1]
     dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[...,:1].shape)], -1)  # [N_rays, N_samples]
 
@@ -381,8 +419,19 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
         if raw.shape[-1] > 5:
             foreground_weights = get_weights_from_sigmas(raw[...,5], dists, noise)
             uncertainty_map = torch.sum(foreground_weights * uncertainty, -1)
+            if raw.shape[-1] > 6:
+                actor_uncertainty = F.relu(raw[..., 6])
+                actor_weights = get_weights_from_sigmas(raw[...,7], dists, noise)
+                uncertainty_map += torch.sum(actor_weights * actor_uncertainty, -1)
         else:
             uncertainty_map = torch.sum(weights * uncertainty, -1)
+        
+
+    sigma_L1 = 0
+    if raw.shape[-1] > 5:
+        sigma_L1 += raw[...,5].sum(dim=-1) # foreground sigmas
+        if raw.shape[-1] > 7:
+            sigma_L1 += raw[...,7].sum(dim=-1) # actor sigmas
 
     depth_map = torch.sum(weights * z_vals, -1)
     disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1))
@@ -391,12 +440,12 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     if white_bkgd:
         rgb_map = rgb_map + (1.-acc_map[...,None])
 
-    # Calculate weights sparsity loss
-    mask = weights.sum(-1) > 0.5
-    entropy = Categorical(probs = weights+1e-5).entropy()
-    sparsity_loss = entropy * mask
+    ## Calculate weights sparsity loss
+    # mask = weights.sum(-1) > 0.5
+    # entropy = Categorical(probs = weights+1e-5).entropy()
+    # sparsity_loss = entropy * mask
 
-    return rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss, uncertainty_map
+    return rgb_map, disp_map, acc_map, weights, depth_map, sigma_L1, uncertainty_map
 
 
 def render_rays(ray_batch,
@@ -444,10 +493,11 @@ def render_rays(ray_batch,
         sample.
     """
     N_rays = ray_batch.shape[0]
-    rays_o, rays_d = ray_batch[:,0:3], ray_batch[:,3:6] # [N_rays, 3] each
+    rays_o, rays_d, rays_o_cam, rays_d_cam = ray_batch[:,0:3], ray_batch[:,3:6], ray_batch[:,6:9], ray_batch[:,9:12] # [N_rays, 3] each
     time_coords = ray_batch[:,-1]
-    viewdirs = ray_batch[:,-4:-1] if ray_batch.shape[-1] > 8 else None
-    bounds = torch.reshape(ray_batch[...,6:8], [-1,1,2])
+    viewdirs = ray_batch[:,-7:-4] if ray_batch.shape[-1] > 15 else None
+    viewdirs_cam = ray_batch[:,-4:-1] if ray_batch.shape[-1] > 15 else None
+    bounds = torch.reshape(ray_batch[...,12:14], [-1,1,2])
     near, far = bounds[...,0], bounds[...,1] # [-1,1]
 
     t_vals = torch.linspace(0., 1., steps=N_samples)
@@ -475,10 +525,12 @@ def render_rays(ray_batch,
         z_vals = lower + (upper - lower) * t_rand
 
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
+    pts_cam = rays_o_cam[...,None,:] + rays_d_cam[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
     pts = torch.cat([pts, time_coords[:,None].expand(pts.shape[:-1])[:,:,None]], dim=-1)
+    pts_cam = torch.cat([pts_cam, time_coords[:,None].expand(pts_cam.shape[:-1])[:,:,None]], dim=-1)
 
 #     raw = run_network(pts)
-    raw = network_query_fn(pts, viewdirs, network_fn)
+    raw = network_query_fn(pts, pts_cam, viewdirs, viewdirs_cam, network_fn)
     rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss, uncertainty_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
     if N_importance > 0:
@@ -491,11 +543,13 @@ def render_rays(ray_batch,
 
         z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
         pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples + N_importance, 3]
+        pts_cam = rays_o_cam[...,None,:] + rays_d_cam[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
         pts = torch.cat([pts, time_coords[:,None].expand(pts.shape[:-1])[:,:,None]], dim=-1)
+        pts_cam = torch.cat([pts_cam, time_coords[:,None].expand(pts_cam.shape[:-1])[:,:,None]], dim=-1)
 
         run_fn = network_fn if network_fine is None else network_fine
 #         raw = run_network(pts, fn=run_fn)
-        raw = network_query_fn(pts, viewdirs, run_fn)
+        raw = network_query_fn(pts, pts_cam, viewdirs, viewdirs_cam, run_fn)
 
         rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss, uncertainty_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
@@ -627,7 +681,7 @@ def config_parser():
                         help='frequency of console printout and metric loggin')
     parser.add_argument("--i_img",     type=int, default=500, 
                         help='frequency of tensorboard image logging')
-    parser.add_argument("--i_weights", type=int, default=1000, 
+    parser.add_argument("--i_weights", type=int, default=3000, 
                         help='frequency of weight ckpt saving')
     parser.add_argument("--i_testset", type=int, default=1000, 
                         help='frequency of testset saving')
@@ -661,10 +715,11 @@ def train():
     K = None
 
     if args.dataset_type=="epic_kitchens":
-        images, poses, hwf, i_split, bounding_box, near_far, all_frame_idxs = load_epic_kitchens_data(args.datadir)
+        images, poses, hwf, i_split, bounding_box, bounding_box_incameraframe, near_far, all_frame_idxs = load_epic_kitchens_data(args.datadir)
         near, far = near_far
         
         args.bounding_box = bounding_box
+        args.bounding_box_incameraframe = bounding_box_incameraframe
         print('Loaded llff', images.shape, hwf, args.datadir)
 
         i_train, i_val, i_test = i_split
@@ -693,20 +748,20 @@ def train():
 
     # Create log dir and copy the config file
     basedir = args.basedir
-    if args.i_embed==1:
-        args.expname += "_hashXYZ"
-    elif args.i_embed==0:
-        args.expname += "_posXYZ"
-    if args.i_embed_views==2:
-        args.expname += "_sphereVIEW"
-    elif args.i_embed_views==0:
-        args.expname += "_posVIEW"
+    # if args.i_embed==1:
+    #     args.expname += "_hashXYZ"
+    # elif args.i_embed==0:
+    #     args.expname += "_posXYZ"
+    # if args.i_embed_views==2:
+    #     args.expname += "_sphereVIEW"
+    # elif args.i_embed_views==0:
+    #     args.expname += "_posVIEW"
     args.expname += "_fine"+str(args.finest_res) + "_log2T"+str(args.log2_hashmap_size)
     args.expname += "_lr"+str(args.lrate) + "_decay"+str(args.lrate_decay)
-    args.expname += "_BackgroundForeground"
+    args.expname += "_BGFGActorSeparate"
     if args.use_uncertainties:
         args.expname += "_withUncertainty"
-    if args.only_background:
+    if args.only_background or args.only_foreground:
         args.expname += "_STATIC"
     if args.sparse_loss_weight > 0:
         args.expname += "_sparse" + str(args.sparse_loss_weight)
@@ -789,17 +844,18 @@ def train():
         # For random ray batching
         print('get rays')
         rays = np.stack([get_rays_np(H, W, K, p) for p in poses[:,:3,:4]], 0) # [N, ro+rd, H, W, 3]
+        rays_incameraframe = np.stack([get_rays_incameraframe_np(H, W, K) for p in poses[:,:3,:4]], 0)
         print('done, concats')
-        rays_rgb = np.concatenate([rays, images[:,None]], 1) # [N, ro+rd+rgb, H, W, 3]
-        rays_rgb = np.transpose(rays_rgb, [0,2,3,1,4]) # [N, H, W, ro+rd+rgb, 3]
+        rays_rgb = np.concatenate([rays, rays_incameraframe, images[:,None]], 1) # [N, ro+rd+roc+rdc+rgb, H, W, 3]
+        rays_rgb = np.transpose(rays_rgb, [0,2,3,1,4]) # [N, H, W, ro+rd+roc+rdc+rgb, 3]
         N, H, W = rays_rgb.shape[:3]
 
         ##### Appending time coordinates!!!
         broadcasted_frame_idxs = np.broadcast_to(all_frame_idxs[:, np.newaxis, np.newaxis, np.newaxis, np.newaxis], [N, H, W, 1, 3])
-        rays_rgb = np.concatenate([rays_rgb, broadcasted_frame_idxs], 3)
+        rays_rgb = np.concatenate([rays_rgb, broadcasted_frame_idxs], 3) # [N, H, W, ro+rd+roc+rdc+rgb+t, 3]
 
         rays_rgb = np.stack([rays_rgb[i] for i in i_train], 0) # train images only
-        rays_rgb = np.reshape(rays_rgb, [-1,rays_rgb.shape[-2],rays_rgb.shape[-1]]) # [(N-1)*H*W, ro+rd+rgb+t, 3]
+        rays_rgb = np.reshape(rays_rgb, [-1,rays_rgb.shape[-2],rays_rgb.shape[-1]]) # [(N-1)*H*W, ro+rd+roc+rdc+rgb+t, 3]
         rays_rgb = rays_rgb.astype(np.float32)
         print('shuffle rays')
         np.random.shuffle(rays_rgb)
@@ -822,9 +878,6 @@ def train():
     print('TRAIN views are', i_train)
     print('TEST views are', i_test)
     print('VAL views are', i_val)
-
-    # Summary writers
-    # writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
     
     loss_list = []
     psnr_list = []
@@ -839,7 +892,7 @@ def train():
             batch = torch.transpose(batch, 0, 1)
             # batch_rays, target_s = batch[:2], batch[2]
             ## including time coordinates in the ray tensor too
-            batch_rays, target_s = batch[[0, 1, 3]], batch[2]
+            batch_rays, target_s = batch[[0, 1, 2, 3, 5]], batch[4]
 
             i_batch += N_rand
             if i_batch >= rays_rgb.shape[0]:
@@ -902,7 +955,7 @@ def train():
             loss = loss + img_loss0
             psnr0 = mse2psnr(img_loss0)
 
-        sparsity_loss = args.sparse_loss_weight*(extras["sparsity_loss"].sum() + extras["sparsity_loss0"].sum())
+        sparsity_loss = args.sparse_loss_weight*(extras["sparsity_loss"].mean() + extras["sparsity_loss0"].mean())
         loss = loss + sparsity_loss
        
         # add Total Variation loss

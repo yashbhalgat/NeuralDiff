@@ -239,3 +239,30 @@ def get_bbox3d_for_epickitchens(metas, H, W, near, far):
             find_min_max(max_point)
 
     return (torch.tensor(min_bound)-torch.tensor([4.0,4.0,4.0]), torch.tensor(max_bound)+torch.tensor([4.0,4.0,4.0]))
+
+
+def get_bbox3d_for_epickitchens_incameraframe(metas, H, W, near, far):
+    focal = metas["intrinsics"][0][0]
+
+    # ray directions in camera coordinates
+    directions = get_ray_directions(H, W, focal)
+
+    min_bound = [100, 100, 100]
+    max_bound = [-100, -100, -100]
+
+    def find_min_max(pt):
+        for i in range(3):
+            if(min_bound[i] > pt[i]):
+                min_bound[i] = pt[i]
+            if(max_bound[i] < pt[i]):
+                max_bound[i] = pt[i]
+        return
+
+    for i in [0, -1]:
+        for j in [0, -1]:
+            min_point = near*directions[i,j]
+            max_point = far*directions[i,j]
+            find_min_max(min_point)
+            find_min_max(max_point)
+
+    return (torch.tensor(min_bound)-torch.tensor([0.1, 0.1, 0.1]), torch.tensor(max_bound)+torch.tensor([0.1, 0.1, 0.1]))

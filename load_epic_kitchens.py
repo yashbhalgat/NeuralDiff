@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import cv2
 import pdb
 
-from utils import get_bbox3d_for_epickitchens
+from utils import get_bbox3d_for_epickitchens, get_bbox3d_for_epickitchens_incameraframe
 
 trans_t = lambda t : torch.Tensor([
     [1,0,0,0],
@@ -88,8 +88,9 @@ def load_epic_kitchens_data(basedir, half_res=False):
     near, far = min(metas["nears"].values()), max(metas["fars"].values())
 
     xyz_bounding_box = get_bbox3d_for_epickitchens(metas, H, W, near=near, far=far)
+    xyz_bounding_box_incameraframe = get_bbox3d_for_epickitchens_incameraframe(metas, H, W, near=near, far=far)
     min_time = torch.FloatTensor([min(all_frame_idxs)]).to(xyz_bounding_box[0].device)
     max_time = torch.FloatTensor([max(all_frame_idxs)]).to(xyz_bounding_box[1].device)
     xyzt_bounding_box = (torch.cat([xyz_bounding_box[0], min_time]), torch.cat([xyz_bounding_box[1], max_time]))
-
-    return imgs, poses, [H, W, focal], i_split, xyzt_bounding_box, [near, far], all_frame_idxs
+    xyzt_bounding_box_incameraframe = (torch.cat([xyz_bounding_box_incameraframe[0], min_time]), torch.cat([xyz_bounding_box_incameraframe[1], max_time]))
+    return imgs, poses, [H, W, focal], i_split, xyzt_bounding_box, xyzt_bounding_box_incameraframe, [near, far], all_frame_idxs

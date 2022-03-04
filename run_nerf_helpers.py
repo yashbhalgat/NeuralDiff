@@ -52,7 +52,7 @@ class Embedder:
 def get_embedder(multires, args, i=0):
     time_dim = None
     if i == -1:
-        return nn.Identity(), 3
+        return nn.Identity(), 4, None
     elif i==0:
         embed_kwargs = {
                     'include_input' : True,
@@ -67,12 +67,13 @@ def get_embedder(multires, args, i=0):
         embed = lambda x, eo=embedder_obj : eo.embed(x)
         out_dim = embedder_obj.out_dim
     elif i==1:
-        # embed = HashEmbedder(bounding_box=args.bounding_box, \
-        embed = XYZplusT_HashEmbedder(bounding_box=args.bounding_box, \
-                            log2_hashmap_size=args.log2_hashmap_size, \
-                            finest_resolution=args.finest_res)
-        out_dim = embed.out_dim
-        time_dim = embed.time_dim
+        # # embed = HashEmbedder(bounding_box=args.bounding_box, \
+        # embed = XYZplusT_HashEmbedder(bounding_box=args.bounding_box, \
+        #                     log2_hashmap_size=args.log2_hashmap_size, \
+        #                     finest_resolution=args.finest_res)
+        # out_dim = embed.out_dim
+        # time_dim = embed.time_dim
+        return nn.Identity(), 4, None ### I am initializing embeddings in NeRF models itself
     elif i==2:
         embed = SHEncoder()
         out_dim = embed.out_dim
@@ -87,8 +88,7 @@ def create_sigma_and_color_MLP(
     hidden_dim, hidden_dim_color,
     input_ch,
     input_ch_views,
-    geo_feat_dim,
-    use_uncertainties
+    geo_feat_dim
 ):
     # sigma network
     sigma_net = []
@@ -99,10 +99,7 @@ def create_sigma_and_color_MLP(
             in_dim = hidden_dim
         
         if l == num_layers - 1:
-            if use_uncertainties:
-                out_dim = 1 + 1 + geo_feat_dim # 1 sigma + 1 uncertainty + 15 SH features for color
-            else:
-                out_dim = 1 + geo_feat_dim # 1 sigma + 15 SH features for color
+            out_dim = 1 + 1 + geo_feat_dim # 1 sigma + 1 uncertainty + 15 SH features for color
         else:
             out_dim = hidden_dim
         
@@ -126,6 +123,31 @@ def create_sigma_and_color_MLP(
     return nn.ModuleList(sigma_net), nn.ModuleList(color_net)
 
 
+def forward_through_MLP(sigma_net, color_net, embedded_x, embedded_views, \
+                        num_layers, num_layers_color):
+        # sigma
+        h = embedded_x
+        for l in range(num_layers):
+            h = sigma_net[l](h)
+            if l != num_layers - 1:
+                h = F.relu(h, inplace=True)
+
+        sigma, uncertainties, geo_feat = h[..., 0], h[..., 1], h[..., 2:]
+        # always predict uncertainties, just don't use them sometimes!
+        uncertainties = relu_act(uncertainties)
+        sigma = relu_act(sigma)
+
+        # color
+        h = torch.cat([embedded_views, geo_feat], dim=-1)
+        for l in range(num_layers_color):
+            h = color_net[l](h)
+            if l != num_layers_color - 1:
+                h = F.relu(h, inplace=True)
+            
+        color = h
+        return sigma, color, uncertainties
+
+
 # Model
 class NeRF(nn.Module):
     def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False):
@@ -142,12 +164,7 @@ class NeRF(nn.Module):
         self.pts_linears = nn.ModuleList(
             [nn.Linear(input_ch, W)] + [nn.Linear(W, W) if i not in self.skips else nn.Linear(W + input_ch, W) for i in range(D-1)])
         
-        ### Implementation according to the official code release (https://github.com/bmild/nerf/blob/master/run_nerf_helpers.py#L104-L105)
         self.views_linears = nn.ModuleList([nn.Linear(input_ch_views + W, W//2)])
-
-        ### Implementation according to the paper
-        # self.views_linears = nn.ModuleList(
-        #     [nn.Linear(input_ch_views + W, W//2)] + [nn.Linear(W//2, W//2) for i in range(D//2)])
         
         if use_viewdirs:
             self.feature_linear = nn.Linear(W, W)
@@ -201,6 +218,7 @@ class NeRFSmall(nn.Module):
 
         # sigma network
         self.num_layers = num_layers
+        self.num_layers_color = num_layers_color
         self.hidden_dim = hidden_dim
         self.geo_feat_dim = geo_feat_dim
 
@@ -209,37 +227,18 @@ class NeRFSmall(nn.Module):
                                             hidden_dim, hidden_dim_color,
                                             input_ch,
                                             input_ch_views,
-                                            geo_feat_dim,
-                                            use_uncertainties
+                                            geo_feat_dim
                                          )
     
     def forward(self, x):
         input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
 
         # sigma
-        h = input_pts
-        for l in range(self.num_layers):
-            h = self.sigma_net[l](h)
-            if l != self.num_layers - 1:
-                h = F.relu(h, inplace=True)
+        sigma, color, uncertainties = forward_through_MLP(self.sigma_net, self.color_net, \
+                                                          input_pts, input_views, \
+                                                          self.num_layers, self.num_layers_color)
 
-        uncertainties = None
         if self.use_uncertainties:
-            sigma, uncertainties, geo_feat = h[..., 0], h[..., 1], h[..., 1:]
-            uncertainties = relu_act(uncertainties)
-        else:
-            sigma, geo_feat = h[..., 0], h[..., 1:]
-        sigma = relu_act(sigma)
-
-        # color
-        h = torch.cat([input_views, geo_feat], dim=-1)
-        for l in range(self.num_layers_color):
-            h = self.color_net[l](h)
-            if l != self.num_layers_color - 1:
-                h = F.relu(h, inplace=True)
-            
-        color = h
-        if uncertainties is not None:
             outputs = torch.cat([color, sigma.unsqueeze(dim=-1), uncertainties.unsqueeze(dim=-1)], -1)
         else:
             outputs = torch.cat([color, sigma.unsqueeze(dim=-1)], -1)
@@ -279,8 +278,7 @@ class BackgroundForegroundNeRF(nn.Module):
                                                                     hidden_dim, hidden_dim_color,
                                                                     input_ch - time_dim, # only XYZ
                                                                     input_ch_views,
-                                                                    geo_feat_dim,
-                                                                    use_uncertainties=use_uncertainties if only_background else False
+                                                                    geo_feat_dim
                                                                )
 
         ### Foreground Network
@@ -289,52 +287,23 @@ class BackgroundForegroundNeRF(nn.Module):
                                                                     hidden_dim, hidden_dim_color,
                                                                     input_ch, # XYZ + time embedding
                                                                     input_ch_views,
-                                                                    geo_feat_dim,
-                                                                    use_uncertainties=use_uncertainties
+                                                                    geo_feat_dim
                                                                )
-        
-    def forward_through_MLP(self, sigma_net, color_net, embedded_x, embedded_views, use_uncertainties):
-        # sigma
-        h = embedded_x
-        for l in range(self.num_layers):
-            h = sigma_net[l](h)
-            if l != self.num_layers - 1:
-                h = F.relu(h, inplace=True)
-
-        uncertainties = None
-        if use_uncertainties:
-            sigma, uncertainties, geo_feat = h[..., 0], h[..., 1], h[..., 2:]
-            uncertainties = relu_act(uncertainties)
-        else:
-            sigma, geo_feat = h[..., 0], h[..., 1:]
-        sigma = relu_act(sigma)
-
-        # color
-        h = torch.cat([embedded_views, geo_feat], dim=-1)
-        for l in range(self.num_layers_color):
-            h = color_net[l](h)
-            if l != self.num_layers_color - 1:
-                h = F.relu(h, inplace=True)
-            
-        color = h
-        return sigma, color, uncertainties
-
+    
     def forward(self, x):
         input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
         input_xyz, _ = input_pts[..., :-self.time_dim], input_pts[..., -self.time_dim:]
 
+        background_sigma, background_color, background_uncertainties = forward_through_MLP( \
+                                                                        self.background_sigma_net, self.background_color_net, \
+                                                                        input_xyz, input_views, \
+                                                                        self.num_layers, self.num_layers_color)
         if not self.only_background:
-            background_sigma, background_color, _ = self.forward_through_MLP(self.background_sigma_net, self.background_color_net, \
-                                                                        input_xyz, input_views,
-                                                                        use_uncertainties=False)
-            foreground_sigma, foreground_color, foreground_uncertainties = self.forward_through_MLP( \
+            foreground_sigma, foreground_color, foreground_uncertainties = forward_through_MLP( \
                                                                             self.foreground_sigma_net, self.foreground_color_net, \
                                                                             input_pts, input_views, \
-                                                                            use_uncertainties=self.use_uncertainties)
+                                                                            self.num_layers, self.num_layers_color)
         else:
-            background_sigma, background_color, background_uncertainties = self.forward_through_MLP(self.background_sigma_net, self.background_color_net, \
-                                                                        input_xyz, input_views,
-                                                                        use_uncertainties=self.use_uncertainties)
             # dummies for foreground
             foreground_sigma, foreground_color, foreground_uncertainties = torch.zeros_like(background_sigma), torch.zeros_like(background_color), None
 
@@ -343,7 +312,7 @@ class BackgroundForegroundNeRF(nn.Module):
         color = (background_sigma/sigma)[:,None] * background_color + (foreground_sigma/sigma)[:,None] * foreground_color
 
         if self.only_background:
-            if background_uncertainties is not None:
+            if self.use_uncertainties:
                 return torch.cat([color, \
                                 sigma.unsqueeze(dim=-1), \
                                 background_uncertainties.unsqueeze(dim=-1)], -1)
@@ -351,7 +320,7 @@ class BackgroundForegroundNeRF(nn.Module):
                 return torch.cat([color, sigma.unsqueeze(dim=-1)], -1)
 
         if not self.only_background:
-            if foreground_uncertainties is not None:
+            if self.use_uncertainties:
                 return torch.cat([color, \
                                     sigma.unsqueeze(dim=-1), \
                                     foreground_uncertainties.unsqueeze(dim=-1), \
@@ -360,7 +329,195 @@ class BackgroundForegroundNeRF(nn.Module):
                 return torch.cat([color, sigma.unsqueeze(dim=-1)], -1)
 
 
+class BackgroundForegroundNeRF_separateEmbeddings(nn.Module):
+    def __init__(self,
+                 num_layers=3,
+                 hidden_dim=64,
+                 geo_feat_dim=15,
+                 num_layers_color=4,
+                 hidden_dim_color=64,
+                 input_ch=3, input_ch_views=3,
+                 use_uncertainties=False,
+                 only_background=False, # we will rarely use this option
+                 args=None
+                 ):
+        super(BackgroundForegroundNeRF_separateEmbeddings, self).__init__()
+
+        self.input_ch = input_ch # it's raw xyzt, so input_ch=4
+        self.input_ch_views = input_ch_views # has embedded views
+
+        self.num_layers = num_layers
+        self.hidden_dim = hidden_dim
+        self.geo_feat_dim = geo_feat_dim
+        self.num_layers_color = num_layers_color        
+        self.hidden_dim_color = hidden_dim_color
+        self.use_uncertainties = use_uncertainties
+        self.only_background = only_background
+
+        xyz_bounding_box = args.bounding_box[0][:3], args.bounding_box[1][:3]
+        self.BG_embedder = HashEmbedder(bounding_box=xyz_bounding_box, \
+                            log2_hashmap_size=args.log2_hashmap_size, \
+                            finest_resolution=args.finest_res)
+        self.FG_embedder = XYZplusT_HashEmbedder(bounding_box=args.bounding_box, \
+                            log2_hashmap_size=args.log2_hashmap_size, \
+                            finest_resolution=args.finest_res)
+
+        ### Background Network
+        self.BG_sigma_net, self.BG_color_net = create_sigma_and_color_MLP(num_layers, num_layers_color,
+                                                                    hidden_dim, hidden_dim_color,
+                                                                    self.BG_embedder.out_dim, # only XYZ
+                                                                    input_ch_views, geo_feat_dim
+                                                               )
+
+        ### Foreground Network
+        self.FG_sigma_net, self.FG_color_net = create_sigma_and_color_MLP(num_layers, num_layers_color,
+                                                                    hidden_dim, hidden_dim_color,
+                                                                    self.FG_embedder.out_dim, # XYZ + time embedding
+                                                                    input_ch_views, geo_feat_dim
+                                                               )
+    
+    def forward(self, x):
+        input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
+        BG_embedded_xyz = self.BG_embedder(input_pts[...,:3])
+        FG_embedded_xyzt = self.FG_embedder(input_pts)
+
+        BG_sigma, BG_color, BG_uncertainties = forward_through_MLP(self.BG_sigma_net, self.BG_color_net, \
+                                                    BG_embedded_xyz, input_views, \
+                                                    self.num_layers, self.num_layers_color)
+        if not self.only_background:
+            FG_sigma, FG_color, FG_uncertainties = forward_through_MLP(self.FG_sigma_net, self.FG_color_net, \
+                                                    FG_embedded_xyzt, input_views, \
+                                                    self.num_layers, self.num_layers_color)
+        else:
+            # dummies for foreground
+            FG_sigma, FG_color, FG_uncertainties = torch.zeros_like(BG_sigma), torch.zeros_like(BG_color), None
+
+        # Principled color mixing
+        sigma = BG_sigma + FG_sigma + 1e-9
+        color = (BG_sigma/sigma)[:,None] * BG_color + (FG_sigma/sigma)[:,None] * FG_color
+
+        if self.only_background:
+            if self.use_uncertainties:
+                return torch.cat([color, sigma.unsqueeze(dim=-1), BG_uncertainties.unsqueeze(dim=-1)], -1)
+            else:
+                return torch.cat([color, sigma.unsqueeze(dim=-1)], -1)
+
+        if not self.only_background:
+            if self.use_uncertainties:
+                return torch.cat([color, sigma.unsqueeze(dim=-1), \
+                                    FG_uncertainties.unsqueeze(dim=-1), \
+                                    FG_sigma.unsqueeze(dim=-1)], -1)
+            else:
+                return torch.cat([color, sigma.unsqueeze(dim=-1)], -1)
+
+
+class BackgroundForegroundActorNeRF_separateEmbeddings(nn.Module):
+    def __init__(self,
+                 num_layers=3,
+                 hidden_dim=64,
+                 geo_feat_dim=15,
+                 num_layers_color=4,
+                 hidden_dim_color=64,
+                 input_ch=4, input_cam_ch=4,
+                 input_ch_views=3, input_ch_views_cam=3,
+                 use_uncertainties=False,
+                 only_background=False, # we will rarely use this option
+                 args=None
+                 ):
+        super(BackgroundForegroundActorNeRF_separateEmbeddings, self).__init__()
+
+        self.input_ch = input_ch # it's raw xyzt, so input_ch=4
+        self.input_ch_views = input_ch_views # has embedded views
+        self.input_cam_ch = input_cam_ch # should be 4
+        self.input_ch_views_cam = input_ch_views_cam # has embedded views
+
+        self.num_layers = num_layers
+        self.hidden_dim = hidden_dim
+        self.geo_feat_dim = geo_feat_dim
+        self.num_layers_color = num_layers_color        
+        self.hidden_dim_color = hidden_dim_color
+        self.use_uncertainties = use_uncertainties
+        self.only_background = only_background
+
+        xyz_bounding_box = args.bounding_box[0][:3], args.bounding_box[1][:3]
+        self.BG_embedder = HashEmbedder(bounding_box=xyz_bounding_box, \
+                            log2_hashmap_size=args.log2_hashmap_size, \
+                            finest_resolution=args.finest_res)
+        self.FG_embedder = XYZplusT_HashEmbedder(bounding_box=args.bounding_box, \
+                            log2_hashmap_size=args.log2_hashmap_size, \
+                            finest_resolution=args.finest_res)
+        self.ACTOR_embedder = XYZplusT_HashEmbedder(bounding_box=args.bounding_box_incameraframe, \
+                            log2_hashmap_size=args.log2_hashmap_size, \
+                            finest_resolution=args.finest_res)
+
+        ### Background Network
+        self.BG_sigma_net, self.BG_color_net = create_sigma_and_color_MLP(num_layers, num_layers_color,
+                                                                    hidden_dim, hidden_dim_color,
+                                                                    self.BG_embedder.out_dim, # only XYZ
+                                                                    input_ch_views, geo_feat_dim
+                                                               )
+
+        ### Foreground Network
+        self.FG_sigma_net, self.FG_color_net = create_sigma_and_color_MLP(num_layers, num_layers_color,
+                                                                    hidden_dim, hidden_dim_color,
+                                                                    self.FG_embedder.out_dim, # XYZ + time embedding
+                                                                    input_ch_views, geo_feat_dim
+                                                               )
+
+        ### Actor Network
+        self.ACTOR_sigma_net, self.ACTOR_color_net = create_sigma_and_color_MLP(num_layers, num_layers_color,
+                                                                    hidden_dim, hidden_dim_color,
+                                                                    self.ACTOR_embedder.out_dim, # XYZ + time embedding
+                                                                    input_ch_views_cam, geo_feat_dim
+                                                               )
+    
+    def forward(self, x):
+        input_pts, input_pts_cam, input_views, input_views_cam = torch.split(x, [self.input_ch, self.input_cam_ch, self.input_ch_views, self.input_ch_views_cam], dim=-1)
+        BG_embedded_xyz = self.BG_embedder(input_pts[...,:3])
+        FG_embedded_xyzt = self.FG_embedder(input_pts)
+        ACTOR_embedded_xyzt = self.ACTOR_embedder(input_pts_cam)
+
+        BG_sigma, BG_color, _ = forward_through_MLP(self.BG_sigma_net, self.BG_color_net, \
+                                                    BG_embedded_xyz, input_views, \
+                                                    self.num_layers, self.num_layers_color)
+        FG_sigma, FG_color, FG_uncertainties = forward_through_MLP(self.FG_sigma_net, self.FG_color_net, \
+                                                    FG_embedded_xyzt, input_views, \
+                                                    self.num_layers, self.num_layers_color)
+        ACTOR_sigma, ACTOR_color, ACTOR_uncertainties = forward_through_MLP(self.ACTOR_sigma_net, self.ACTOR_color_net, \
+                                                    ACTOR_embedded_xyzt, input_views_cam, \
+                                                    self.num_layers, self.num_layers_color)
+
+        # Principled color mixing
+        sigma = BG_sigma + FG_sigma + ACTOR_sigma + 1e-9
+        color = (BG_sigma/sigma)[:,None] * BG_color + (FG_sigma/sigma)[:,None] * FG_color + (ACTOR_sigma/sigma)[:,None] * ACTOR_color
+
+        if self.use_uncertainties:
+            return torch.cat([color, sigma.unsqueeze(dim=-1), \
+                                FG_uncertainties.unsqueeze(dim=-1), \
+                                FG_sigma.unsqueeze(dim=-1), \
+                                ACTOR_uncertainties.unsqueeze(dim=-1), \
+                                ACTOR_sigma.unsqueeze(dim=-1)], -1)
+        else:
+            return torch.cat([color, sigma.unsqueeze(dim=-1)], -1)
+
+
 # Ray helpers
+def get_rays_incameraframe(H, W, K):
+    i, j = torch.meshgrid(torch.linspace(0, W-1, W), torch.linspace(0, H-1, H))  # pytorch's meshgrid has indexing='ij'
+    i = i.t()
+    j = j.t()
+    dirs = torch.stack([(i-K[0][2])/K[0][0], -(j-K[1][2])/K[1][1], -torch.ones_like(i)], -1)
+    origins = torch.zeros_like(dirs)
+    return origins, dirs
+
+
+def get_rays_incameraframe_np(H, W, K):
+    i, j = np.meshgrid(np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32), indexing='xy')
+    dirs = np.stack([(i-K[0][2])/K[0][0], -(j-K[1][2])/K[1][1], -np.ones_like(i)], -1)
+    origins = np.zeros_like(dirs)
+    return origins, dirs
+
+
 def get_rays(H, W, K, c2w):
     i, j = torch.meshgrid(torch.linspace(0, W-1, W), torch.linspace(0, H-1, H))  # pytorch's meshgrid has indexing='ij'
     i = i.t()
