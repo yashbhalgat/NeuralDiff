@@ -1,6 +1,7 @@
 import math
 import os, sys
 from datetime import datetime
+from unittest import installHandler
 import numpy as np
 import imageio
 import json
@@ -18,7 +19,8 @@ import matplotlib.pyplot as plt
 
 from run_nerf_helpers import *
 from radam import RAdam
-from extra_losses import sigma_sparsity_loss, total_variation_loss
+from extra_losses import sigma_sparsity_loss, total_variation_loss_3D, total_variation_loss_1D
+from hash_encoding import HashEmbedder, XYZplusT_HashEmbedder, Linear_HashEmbedder
 
 from load_epic_kitchens import load_epic_kitchens_data
 
@@ -218,12 +220,7 @@ def create_nerf(args):
     embed_fn, input_ch, time_dim = get_embedder(args.multires, args, i=args.i_embed)
     if args.i_embed==1:
         # hashed embedding table
-        if not args.only_foreground:
-            embedding_params = list(embed_fn.parameters())
-        else:
-            for param in embed_fn.xyz_embedder.parameters():
-                param.requires_grad = False
-            embedding_params = list(embed_fn.t_embedder.parameters())
+        embedding_params = list(embed_fn.parameters())
 
     input_ch_views = 0
     embeddirs_fn = None
@@ -234,6 +231,38 @@ def create_nerf(args):
     output_ch = 5 if args.N_importance > 0 else 4
     skips = [4]
     
+    xyz_bounding_box = args.bounding_box[0][:3], args.bounding_box[1][:3]
+    xyz_bounding_box_cam = args.bounding_box_incameraframe[0][:3], args.bounding_box_incameraframe[1][:3]
+    t_bounding_range = args.bounding_box[0][3], args.bounding_box[1][3]
+    
+    ### DEFINING THE FOUNDATIONAL BLOCKS
+    world_grid_embed = HashEmbedder(bounding_box=xyz_bounding_box, \
+                        log2_hashmap_size=args.log2_hashmap_size, \
+                        finest_resolution=args.finest_res)
+    world_grid_embed_FG = None
+    camera_grid_embed = HashEmbedder(bounding_box=xyz_bounding_box_cam, \
+                        log2_hashmap_size=args.log2_hashmap_size, \
+                        finest_resolution=args.finest_res)
+    time_grid_embed = Linear_HashEmbedder(t_bounding_range)
+
+    ### DERIVING EMBEDDERS
+    FG_embedder = XYZplusT_HashEmbedder(bounding_box=args.bounding_box, \
+                                        xyz_embedder=world_grid_embed,
+                                        t_embedder=time_grid_embed)
+    ACTOR_embedder = XYZplusT_HashEmbedder(bounding_box=args.bounding_box_incameraframe, \
+                                        xyz_embedder=camera_grid_embed,
+                                        t_embedder=time_grid_embed)
+
+    # BG_embedder = HashEmbedder(bounding_box=xyz_bounding_box, \
+    #                     log2_hashmap_size=args.log2_hashmap_size, \
+    #                     finest_resolution=args.finest_res)
+    # FG_embedder = XYZplusT_HashEmbedder(bounding_box=args.bounding_box, \
+    #                     log2_hashmap_size=args.log2_hashmap_size, \
+    #                     finest_resolution=args.finest_res)
+    # ACTOR_embedder = XYZplusT_HashEmbedder(bounding_box=args.bounding_box_incameraframe, \
+    #                     log2_hashmap_size=args.log2_hashmap_size, \
+    #                     finest_resolution=args.finest_res)
+
     if args.i_embed==1:
         model_class = BackgroundForegroundActorNeRF_separateEmbeddings
         model = model_class(num_layers=2,
@@ -245,26 +274,19 @@ def create_nerf(args):
                         input_ch_views=input_ch_views, input_ch_views_cam=input_ch_views,
                         # time_dim=time_dim,
                         use_uncertainties=args.use_uncertainties,
-                        only_background=args.only_background,
-                        args=args).to(device)
-        if args.only_foreground:
-            ### Making sure the initial sigma outputs are zero
-            for name, param in model.foreground_sigma_net.named_parameters():
-                if 'weight' in name or 'bias' in name:
-                    param.data.zero_()
+                        BG_embedder=world_grid_embed, FG_embedder=FG_embedder, ACTOR_embedder=ACTOR_embedder).to(device)
     else:
         model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
                  input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
 
-    if not args.only_foreground:
-        grad_vars = list(model.parameters())
-    else:
-        for param in model.background_sigma_net.parameters():
-            param.requires_grad = False
-        for param in model.background_color_net.parameters():
-            param.requires_grad = False
-        grad_vars = list(model.foreground_sigma_net.parameters())+list(model.foreground_color_net.parameters())
+    embedding_params = []
+    grad_vars = []
+    for _, child in model.named_children():
+        if isinstance(child, HashEmbedder) or isinstance(child, Linear_HashEmbedder) or isinstance(child, XYZplusT_HashEmbedder):
+            embedding_params += list(child.parameters())
+        else:
+            grad_vars += list(child.parameters())
 
     model_fine = None
     if args.N_importance > 0:
@@ -279,26 +301,18 @@ def create_nerf(args):
                         input_ch_views=input_ch_views, input_ch_views_cam=input_ch_views,
                         # time_dim=time_dim,
                         use_uncertainties=args.use_uncertainties,
-                        only_background=args.only_background,
-                        args=args).to(device)
-            if args.only_foreground:
-                ### Making sure the initial sigma outputs are zero
-                for name, param in model_fine.foreground_sigma_net.named_parameters():
-                    if 'weight' in name or 'bias' in name:
-                        param.data.zero_()
+                        BG_embedder=world_grid_embed, FG_embedder=FG_embedder, ACTOR_embedder=ACTOR_embedder).to(device)
         else:
             model_fine = NeRF(D=args.netdepth_fine, W=args.netwidth_fine,
                           input_ch=input_ch, output_ch=output_ch, skips=skips,
                           input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
 
-        if not args.only_foreground:
-            grad_vars += list(model_fine.parameters())
-        else:
-            for param in model_fine.background_sigma_net.parameters():
-                param.requires_grad = False
-            for param in model_fine.background_color_net.parameters():
-                param.requires_grad = False
-            grad_vars += list(model_fine.foreground_sigma_net.parameters())+list(model_fine.foreground_color_net.parameters())
+        for _, child in model_fine.named_children():
+            if isinstance(child, HashEmbedder) or isinstance(child, Linear_HashEmbedder) or isinstance(child, XYZplusT_HashEmbedder):
+                embedding_params += list(child.parameters())
+            else:
+                grad_vars += list(child.parameters())
+            # grad_vars += list(model_fine.parameters())
 
     network_query_fn = lambda inputs, inputs_cam, viewdirs, viewdirs_cam, network_fn : run_network(inputs, inputs_cam, viewdirs, viewdirs_cam, network_fn,
                                                                 embed_fn=embed_fn,
@@ -310,6 +324,8 @@ def create_nerf(args):
         # sparse_opt = torch.optim.SparseAdam(embedding_params, lr=args.lrate, betas=(0.9, 0.99), eps=1e-15)
         # dense_opt = torch.optim.Adam(grad_vars, lr=args.lrate, betas=(0.9, 0.99), weight_decay=1e-6)
         # optimizer = MultiOptimizer(optimizers={"sparse_opt": sparse_opt, "dense_opt": dense_opt})
+        embedding_params = list(set(embedding_params))
+        grad_vars = list(set(grad_vars))
         optimizer = RAdam([
                             {'params': grad_vars, 'weight_decay': 1e-6},
                             {'params': embedding_params, 'eps': 1e-15}
@@ -345,9 +361,15 @@ def create_nerf(args):
             model_fine.load_state_dict(ckpt['network_fine_state_dict'])
         if args.i_embed==1:
             embed_fn.load_state_dict(ckpt['embed_fn_state_dict'])
+        if world_grid_embed:
+            world_grid_embed.load_state_dict(ckpt['world_grid_state_dict'])
+        if world_grid_embed_FG:
+            world_grid_embed_FG.load_state_dict(ckpt['world_grid_FG_state_dict'])
+        if camera_grid_embed:
+            camera_grid_embed.load_state_dict(ckpt['camera_grid_state_dict'])
+        if time_grid_embed:
+            time_grid_embed.load_state_dict(ckpt['time_grid_state_dict'])
 
-    ##########################
-    # pdb.set_trace()
 
     render_kwargs_train = {
         'network_query_fn' : network_query_fn,
@@ -360,6 +382,10 @@ def create_nerf(args):
         'use_viewdirs' : args.use_viewdirs,
         'white_bkgd' : args.white_bkgd,
         'raw_noise_std' : args.raw_noise_std,
+        'embedders': {'world_grid_embed': world_grid_embed, \
+                      'world_grid_embed_FG': world_grid_embed_FG, \
+                      'camera_grid_embed': camera_grid_embed, \
+                      'time_grid_embed': time_grid_embed}
     }
 
     # NDC only good for LLFF-style forward facing data
@@ -452,6 +478,7 @@ def render_rays(ray_batch,
                 network_fn,
                 network_query_fn,
                 N_samples,
+                embedders=None,
                 embed_fn=None,
                 retraw=False,
                 lindisp=False,
@@ -758,7 +785,7 @@ def train():
     #     args.expname += "_posVIEW"
     args.expname += "_fine"+str(args.finest_res) + "_log2T"+str(args.log2_hashmap_size)
     args.expname += "_lr"+str(args.lrate) + "_decay"+str(args.lrate_decay)
-    args.expname += "_BGFGActorSeparate"
+    args.expname += "_BGFGActorV1"
     if args.use_uncertainties:
         args.expname += "_withUncertainty"
     if args.only_background or args.only_foreground:
@@ -961,14 +988,30 @@ def train():
         # add Total Variation loss
         if args.i_embed==1:
             if args.tv_loss_weight > 0:
-                n_levels = render_kwargs_train["embed_fn"].n_levels
-                min_res = render_kwargs_train["embed_fn"].base_resolution
-                max_res = render_kwargs_train["embed_fn"].finest_resolution
-                log2_hashmap_size = render_kwargs_train["embed_fn"].log2_hashmap_size
-                TV_loss = sum(total_variation_loss(render_kwargs_train["embed_fn"].embeddings[i], \
+                TV_loss = 0.0
+                for embed in ['world_grid_embed', 'camera_grid_embed', 'world_grid_embed_FG']:
+                    if render_kwargs_train['embedders'][embed] is None:
+                        continue
+                    n_levels = render_kwargs_train['embedders'][embed].n_levels
+                    min_res = render_kwargs_train['embedders'][embed].base_resolution
+                    max_res = render_kwargs_train['embedders'][embed].finest_resolution
+                    log2_hashmap_size = render_kwargs_train['embedders'][embed].log2_hashmap_size
+                    TV_loss += sum(total_variation_loss_3D(render_kwargs_train['embedders'][embed].embeddings[i], \
+                                                    min_res, max_res, \
+                                                    i, log2_hashmap_size, \
+                                                    n_levels=n_levels) for i in range(n_levels))
+                
+                ### TV loss on time
+                embed = 'time_grid_embed'
+                n_levels = render_kwargs_train['embedders'][embed].n_levels
+                min_res = render_kwargs_train['embedders'][embed].base_resolution
+                max_res = render_kwargs_train['embedders'][embed].finest_resolution
+                log2_hashmap_size = render_kwargs_train['embedders'][embed].log2_hashmap_size
+                TV_loss += sum(total_variation_loss_1D(render_kwargs_train['embedders'][embed].embeddings[i], \
                                                 min_res, max_res, \
                                                 i, log2_hashmap_size, \
                                                 n_levels=n_levels) for i in range(n_levels))
+
                 loss = loss + args.tv_loss_weight * TV_loss
                 if i>1000:
                     args.tv_loss_weight = 0.0
@@ -999,6 +1042,10 @@ def train():
                     'network_fn_state_dict': render_kwargs_train['network_fn'].state_dict(),
                     'network_fine_state_dict': render_kwargs_train['network_fine'].state_dict(),
                     'embed_fn_state_dict': render_kwargs_train['embed_fn'].state_dict(),
+                    'world_grid_state_dict': render_kwargs_train['embedders']['world_grid_embed'].state_dict(),
+                    'world_grid_FG_state_dict': render_kwargs_train['embedders']['world_grid_embed_FG'].state_dict(),
+                    'camera_grid_state_dict': render_kwargs_train['embedders']['camera_grid_embed'].state_dict(),
+                    'time_grid_state_dict': render_kwargs_train['embedders']['time_grid_embed'].state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                 }, path)
             else:

@@ -1,4 +1,3 @@
-from ast import If
 import torch
 # torch.autograd.set_detect_anomaly(True)
 import torch.nn as nn
@@ -421,8 +420,7 @@ class BackgroundForegroundActorNeRF_separateEmbeddings(nn.Module):
                  input_ch=4, input_cam_ch=4,
                  input_ch_views=3, input_ch_views_cam=3,
                  use_uncertainties=False,
-                 only_background=False, # we will rarely use this option
-                 args=None
+                 BG_embedder=None, FG_embedder=None, ACTOR_embedder=None
                  ):
         super(BackgroundForegroundActorNeRF_separateEmbeddings, self).__init__()
 
@@ -437,18 +435,18 @@ class BackgroundForegroundActorNeRF_separateEmbeddings(nn.Module):
         self.num_layers_color = num_layers_color        
         self.hidden_dim_color = hidden_dim_color
         self.use_uncertainties = use_uncertainties
-        self.only_background = only_background
-
-        xyz_bounding_box = args.bounding_box[0][:3], args.bounding_box[1][:3]
-        self.BG_embedder = HashEmbedder(bounding_box=xyz_bounding_box, \
-                            log2_hashmap_size=args.log2_hashmap_size, \
-                            finest_resolution=args.finest_res)
-        self.FG_embedder = XYZplusT_HashEmbedder(bounding_box=args.bounding_box, \
-                            log2_hashmap_size=args.log2_hashmap_size, \
-                            finest_resolution=args.finest_res)
-        self.ACTOR_embedder = XYZplusT_HashEmbedder(bounding_box=args.bounding_box_incameraframe, \
-                            log2_hashmap_size=args.log2_hashmap_size, \
-                            finest_resolution=args.finest_res)
+        
+        # xyz_bounding_box = args.bounding_box[0][:3], args.bounding_box[1][:3]
+        # self.BG_embedder = HashEmbedder(bounding_box=xyz_bounding_box, \
+        #                     log2_hashmap_size=args.log2_hashmap_size, \
+        #                     finest_resolution=args.finest_res)
+        # self.FG_embedder = XYZplusT_HashEmbedder(bounding_box=args.bounding_box, \
+        #                     log2_hashmap_size=args.log2_hashmap_size, \
+        #                     finest_resolution=args.finest_res)
+        # self.ACTOR_embedder = XYZplusT_HashEmbedder(bounding_box=args.bounding_box_incameraframe, \
+        #                     log2_hashmap_size=args.log2_hashmap_size, \
+        #                     finest_resolution=args.finest_res)
+        self.BG_embedder, self.FG_embedder, self.ACTOR_embedder = BG_embedder, FG_embedder, ACTOR_embedder
 
         ### Background Network
         self.BG_sigma_net, self.BG_color_net = create_sigma_and_color_MLP(num_layers, num_layers_color,

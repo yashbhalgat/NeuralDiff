@@ -123,21 +123,36 @@ class Linear_HashEmbedder(nn.Module):
 
 
 class XYZplusT_HashEmbedder(nn.Module):
-    def __init__(self, bounding_box, n_levels=16, n_features_per_level=2,\
+    def __init__(self, bounding_box, xyz_embedder=None, t_embedder=None, \
+                n_levels=16, n_features_per_level=2,\
                 log2_hashmap_size=19, base_resolution=16, finest_resolution=512):
         super(XYZplusT_HashEmbedder, self).__init__()
         self.bounding_box = bounding_box
-        self.n_levels = n_levels
-        self.base_resolution = torch.tensor(base_resolution)
-        self.finest_resolution = torch.tensor(finest_resolution)
-        self.b = torch.exp((torch.log(self.finest_resolution.float())-torch.log(self.base_resolution.float()))/(n_levels-1))
-        self.log2_hashmap_size = log2_hashmap_size
+        if xyz_embedder is None:
+            self.n_levels = n_levels
+            self.base_resolution = torch.tensor(base_resolution)
+            self.finest_resolution = torch.tensor(finest_resolution)
+            self.b = torch.exp((torch.log(self.finest_resolution.float())-torch.log(self.base_resolution.float()))/(n_levels-1))
+            self.log2_hashmap_size = log2_hashmap_size
+            self.xyz_bounding_box = bounding_box[0][:3], bounding_box[1][:3]
+            self.xyz_embedder = HashEmbedder(self.xyz_bounding_box, finest_resolution=finest_resolution, 
+                                            log2_hashmap_size=log2_hashmap_size)
+        else:
+            self.n_levels = xyz_embedder.n_levels
+            self.base_resolution = torch.tensor(xyz_embedder.base_resolution)
+            self.finest_resolution = torch.tensor(xyz_embedder.finest_resolution)
+            self.b = torch.exp((torch.log(self.finest_resolution.float())-torch.log(self.base_resolution.float()))/(self.n_levels-1))
+            self.log2_hashmap_size = xyz_embedder.log2_hashmap_size
+            self.xyz_bounding_box = xyz_embedder.bounding_box
+            self.xyz_embedder = xyz_embedder
 
-        xyz_bounding_box = bounding_box[0][:3], bounding_box[1][:3]
-        t_bounding_range = bounding_box[0][3], bounding_box[1][3]
-        self.xyz_embedder = HashEmbedder(xyz_bounding_box, finest_resolution=finest_resolution, 
-                                         log2_hashmap_size=log2_hashmap_size)
-        self.t_embedder = Linear_HashEmbedder(t_bounding_range)
+        if t_embedder is None:
+            self.t_bounding_range = bounding_box[0][3], bounding_box[1][3]
+            self.t_embedder = Linear_HashEmbedder(self.t_bounding_range)
+        else:
+            self.t_bounding_range = t_embedder.bounding_range
+            self.t_embedder = t_embedder
+        
         self.out_dim = self.xyz_embedder.out_dim + self.t_embedder.out_dim
         self.time_dim = self.t_embedder.out_dim
 
