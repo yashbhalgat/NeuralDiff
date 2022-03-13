@@ -239,7 +239,9 @@ def create_nerf(args):
     world_grid_embed = HashEmbedder(bounding_box=xyz_bounding_box, \
                         log2_hashmap_size=args.log2_hashmap_size, \
                         finest_resolution=args.finest_res)
-    world_grid_embed_FG = None
+    world_grid_embed_FG = HashEmbedder(bounding_box=xyz_bounding_box, \
+                        log2_hashmap_size=args.log2_hashmap_size, \
+                        finest_resolution=args.finest_res)
     camera_grid_embed = HashEmbedder(bounding_box=xyz_bounding_box_cam, \
                         log2_hashmap_size=args.log2_hashmap_size, \
                         finest_resolution=args.finest_res)
@@ -247,7 +249,7 @@ def create_nerf(args):
 
     ### DERIVING EMBEDDERS
     FG_embedder = XYZplusT_HashEmbedder(bounding_box=args.bounding_box, \
-                                        xyz_embedder=world_grid_embed,
+                                        xyz_embedder=world_grid_embed_FG,
                                         t_embedder=time_grid_embed)
     ACTOR_embedder = XYZplusT_HashEmbedder(bounding_box=args.bounding_box_incameraframe, \
                                         xyz_embedder=camera_grid_embed,
@@ -264,17 +266,18 @@ def create_nerf(args):
     #                     finest_resolution=args.finest_res)
 
     if args.i_embed==1:
-        model_class = BackgroundForegroundActorNeRF_separateEmbeddings
+        # model_class = BackgroundForegroundActorNeRF_separateEmbeddings
+        model_class = NeuralDiff
         model = model_class(num_layers=2,
                         hidden_dim=64,
                         geo_feat_dim=15,
                         num_layers_color=3,
-                        hidden_dim_color=64,
                         input_ch=input_ch, input_cam_ch=input_ch,
                         input_ch_views=input_ch_views, input_ch_views_cam=input_ch_views,
-                        # time_dim=time_dim,
                         use_uncertainties=args.use_uncertainties,
-                        BG_embedder=world_grid_embed, FG_embedder=FG_embedder, ACTOR_embedder=ACTOR_embedder).to(device)
+                        world_grid_embed=world_grid_embed, camera_grid_embed=camera_grid_embed, time_grid_embed=time_grid_embed,
+                        big=args.big,
+                        coarse=True).to(device)
     else:
         model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
@@ -291,17 +294,18 @@ def create_nerf(args):
     model_fine = None
     if args.N_importance > 0:
         if args.i_embed==1:
-            model_class = BackgroundForegroundActorNeRF_separateEmbeddings
+            # model_class = BackgroundForegroundActorNeRF_separateEmbeddings
+            model_class = NeuralDiff
             model_fine = model_class(num_layers=2,
-                        hidden_dim=64,
-                        geo_feat_dim=15,
-                        num_layers_color=3,
-                        hidden_dim_color=64,
-                        input_ch=input_ch, input_cam_ch=input_ch,
-                        input_ch_views=input_ch_views, input_ch_views_cam=input_ch_views,
-                        # time_dim=time_dim,
-                        use_uncertainties=args.use_uncertainties,
-                        BG_embedder=world_grid_embed, FG_embedder=FG_embedder, ACTOR_embedder=ACTOR_embedder).to(device)
+                            hidden_dim=64,
+                            geo_feat_dim=15,
+                            num_layers_color=3,
+                            input_ch=input_ch, input_cam_ch=input_ch,
+                            input_ch_views=input_ch_views, input_ch_views_cam=input_ch_views,
+                            use_uncertainties=args.use_uncertainties,
+                            world_grid_embed=world_grid_embed, camera_grid_embed=camera_grid_embed, time_grid_embed=time_grid_embed,
+                            big=args.big,
+                            coarse=False).to(device)
         else:
             model_fine = NeRF(D=args.netdepth_fine, W=args.netwidth_fine,
                           input_ch=input_ch, output_ch=output_ch, skips=skips,
@@ -441,19 +445,21 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
 
     uncertainty_map = None
     if raw.shape[-1] > 4:
-        uncertainty = F.relu(raw[..., 4])
+        foreground_uncertainty = F.relu(raw[..., 4])
         if raw.shape[-1] > 5:
             foreground_weights = get_weights_from_sigmas(raw[...,5], dists, noise)
-            uncertainty_map = torch.sum(foreground_weights * uncertainty, -1)
+            uncertainty_map = torch.sum(foreground_weights * foreground_uncertainty, -1)
             if raw.shape[-1] > 6:
                 actor_uncertainty = F.relu(raw[..., 6])
                 actor_weights = get_weights_from_sigmas(raw[...,7], dists, noise)
                 uncertainty_map += torch.sum(actor_weights * actor_uncertainty, -1)
         else:
-            uncertainty_map = torch.sum(weights * uncertainty, -1)
+            uncertainty_map = torch.sum(weights * foreground_uncertainty, -1)
+        # adding beta_min as in NeRF-W
+        uncertainty_map += 0.03
         
 
-    sigma_L1 = 0
+    sigma_L1 = torch.zeros(raw.shape[0])
     if raw.shape[-1] > 5:
         sigma_L1 += raw[...,5].sum(dim=-1) # foreground sigmas
         if raw.shape[-1] > 7:
@@ -729,6 +735,8 @@ def config_parser():
                         help='train only the static/background model')
     parser.add_argument("--only-foreground", action='store_true', 
                         help='train only the dynamic/foreground model')
+    parser.add_argument("--big", action='store_true', 
+                        help='use bigger actor and foreground model')
  
     return parser
 
@@ -785,9 +793,11 @@ def train():
     #     args.expname += "_posVIEW"
     args.expname += "_fine"+str(args.finest_res) + "_log2T"+str(args.log2_hashmap_size)
     args.expname += "_lr"+str(args.lrate) + "_decay"+str(args.lrate_decay)
-    args.expname += "_BGFGActorV1"
+    args.expname += "_NeuralDiff_CoarseStat"
     if args.use_uncertainties:
         args.expname += "_withUncertainty"
+    if args.big:
+        args.expname += "_Big"
     if args.only_background or args.only_foreground:
         args.expname += "_STATIC"
     if args.sparse_loss_weight > 0:
@@ -972,13 +982,13 @@ def train():
 
         trans = extras['raw'][...,-1]
         loss = img_loss
-        psnr = mse2psnr(img_loss)
+        psnr = mse2psnr(img2mse(rgb, target_s))
 
         if 'rgb0' in extras:
-            if 'uncertainty_map0' not in extras:
-                img_loss0 = img2mse(extras['rgb0'], target_s)
-            else:
-                img_loss0 = img2mse_with_uncertainty(extras['rgb0'], target_s, extras['uncertainty_map0'].unsqueeze(-1))
+            # if 'uncertainty_map0' not in extras:
+            img_loss0 = img2mse(extras['rgb0'], target_s)
+            # else:
+            #     img_loss0 = img2mse_with_uncertainty(extras['rgb0'], target_s, extras['uncertainty_map0'].unsqueeze(-1))
             loss = loss + img_loss0
             psnr0 = mse2psnr(img_loss0)
 
@@ -1043,7 +1053,7 @@ def train():
                     'network_fine_state_dict': render_kwargs_train['network_fine'].state_dict(),
                     'embed_fn_state_dict': render_kwargs_train['embed_fn'].state_dict(),
                     'world_grid_state_dict': render_kwargs_train['embedders']['world_grid_embed'].state_dict(),
-                    'world_grid_FG_state_dict': render_kwargs_train['embedders']['world_grid_embed_FG'].state_dict(),
+                    'world_grid_FG_state_dict': render_kwargs_train['embedders']['world_grid_embed_FG'].state_dict() if render_kwargs_train['embedders']['world_grid_embed_FG'] else [],
                     'camera_grid_state_dict': render_kwargs_train['embedders']['camera_grid_embed'].state_dict(),
                     'time_grid_state_dict': render_kwargs_train['embedders']['time_grid_embed'].state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
