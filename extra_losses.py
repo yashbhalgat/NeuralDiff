@@ -3,7 +3,7 @@ import torch
 from torch import nn
 import pdb
 
-from utils import hash
+from hash_utils import hash
 
 
 def total_variation_loss_3D(embeddings, min_resolution, max_resolution, level, log2_hashmap_size, n_levels=16):

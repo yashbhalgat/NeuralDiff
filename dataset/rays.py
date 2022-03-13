@@ -1,6 +1,7 @@
 import json
 import os
 import random
+import pdb
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -83,7 +84,7 @@ class EPICDiff(Dataset):
         c2c = torch.zeros(3, 4).to(c2w.device)
         c2c[:3, :3] = torch.eye(3, 3).to(c2w.device)
         rays_o_c, rays_d_c = get_rays(directions, c2c)
-
+        
         rays_t = idx * torch.ones(len(rays_o), 1).long()
 
         rays = torch.cat(
@@ -133,6 +134,21 @@ class EPICDiff(Dataset):
             self.rays = torch.cat(self.rays, 0)  # ((N_images-1)*h*w, 8)
             self.rgbs = torch.cat(self.rgbs, 0)  # ((N_images-1)*h*w, 3)
             self.ts = torch.cat(self.ts, 0)
+
+            ### calculate bounding box
+            points = torch.cat([
+                self.rays[:, 0:3] + self.rays[:, 3:6]*self.rays[:, 6:7],
+                self.rays[:, 0:3] + self.rays[:, 3:6]*self.rays[:, 7:8]
+            ], dim=0)
+            self.bounding_box = (points.min(dim=0)[0]-torch.tensor([1.0,1.0,1.0]), points.max(dim=0)[0]+torch.tensor([1.0,1.0,1.0]))
+            self.bounding_box = (self.bounding_box[0].cuda(), self.bounding_box[1].cuda())
+
+            points_c = torch.cat([
+                self.rays[:, 8:11] + self.rays[:, 11:14]*self.rays[:, 6:7],
+                self.rays[:, 8:11] + self.rays[:, 11:14]*self.rays[:, 7:8]
+            ], dim=0)
+            self.bounding_box_c = (points_c.min(dim=0)[0]-torch.tensor([0.1, 0.1, 0.1]) , points_c.max(dim=0)[0]+torch.tensor([0.1, 0.1, 0.1]))
+            self.bounding_box_c = (self.bounding_box_c[0].cuda(), self.bounding_box_c[1].cuda())
 
     def __len__(self):
         if self.split == "train":

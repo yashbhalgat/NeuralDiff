@@ -98,7 +98,7 @@ def render_rays(
         # Perform model inference to get rgb, sigma
         B = xyz_.shape[0]
         out_chunks = []
-        xyz_c_embedded_ = embedding_xyz(xyz_c_)
+        # xyz_c_embedded_ = embedding_xyz(xyz_c_)
         if typ == "coarse" and test_time:
             for i in range(0, B, chunk):
                 xyz_embedded = embedding_xyz(xyz_[i : i + chunk])
@@ -124,7 +124,7 @@ def render_rays(
                 if output_dynamic:
                     inputs += [a_embedded_[i : i + chunk]]
                     inputs += [t_embedded_[i : i + chunk]]
-                    inputs += [embedding_xyz(xyz_c_[i : i + chunk])]
+                    inputs += [embedding_xyz_c(xyz_c_[i : i + chunk])]
                 out_chunks += [
                     model(
                         torch.cat(inputs, 1),
@@ -344,7 +344,7 @@ def render_rays(
 
     hp = kwargs["hp"]
 
-    embedding_xyz, embedding_dir = embeddings["xyz"], embeddings["dir"]
+    embedding_xyz, embedding_xyz_c, embedding_dir = embeddings["xyz"], embeddings["xyz_c"],  embeddings["dir"]
 
     # separate input into ray origins, directions, near, far bounds etc.
     N_rays = rays.shape[0]

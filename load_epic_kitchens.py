@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import cv2
 import pdb
 
-from utils import get_bbox3d_for_epickitchens, get_bbox3d_for_epickitchens_incameraframe
+from hash_utils import get_bbox3d_for_epickitchens, get_bbox3d_for_epickitchens_incameraframe
 
 trans_t = lambda t : torch.Tensor([
     [1,0,0,0],

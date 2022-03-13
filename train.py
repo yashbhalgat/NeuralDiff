@@ -1,3 +1,4 @@
+from gc import callbacks
 import os
 from collections import defaultdict
 
@@ -7,6 +8,7 @@ import torch
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
+import pdb
 
 import dataset
 import model
@@ -15,6 +17,16 @@ from evaluation.metrics import *
 from loss import Loss
 from opt import get_opts
 from utils import *
+from hash_encoding import HashEmbedder, Linear_HashEmbedder, SHEncoder
+
+
+class ValEveryNSteps(pytorch_lightning.Callback):
+    def __init__(self, every_n_step):
+        self.every_n_step = every_n_step
+
+    def on_batch_end(self, trainer, pl_module):
+        if trainer.global_step % self.every_n_step == 0 and trainer.global_step != 0:
+            trainer.run_evaluation()
 
 
 class NeuralDiffSystem(pytorch_lightning.LightningModule):
@@ -25,21 +37,41 @@ class NeuralDiffSystem(pytorch_lightning.LightningModule):
             utils.set_deterministic()
 
         # for avoiding reinitialization of dataloaders when debugging/using notebook
-        self.train_dataset = train_dataset
-        self.val_dataset = val_dataset
+        self.train_dataset = dataset.EPICDiff(vid=self.hparams.vid, root=self.hparams.root, split="train")
+        self.val_dataset = dataset.EPICDiff(vid=self.hparams.vid, root=self.hparams.root, split="val")
 
         self.loss = Loss()
 
         self.models_to_train = []
-        self.embedding_xyz = model.PosEmbedding(
-            hparams.N_emb_xyz - 1, hparams.N_emb_xyz
-        )
-        self.embedding_dir = model.PosEmbedding(
-            hparams.N_emb_dir - 1, hparams.N_emb_dir
-        )
+        
+        if not self.hparams.use_hash:
+            self.embedding_xyz = model.PosEmbedding(
+                hparams.N_emb_xyz - 1, hparams.N_emb_xyz
+            )
+            self.embedding_xyz_c = model.PosEmbedding(
+                hparams.N_emb_xyz - 1, hparams.N_emb_xyz
+            )
+            self.embedding_dir = model.PosEmbedding(
+                hparams.N_emb_dir - 1, hparams.N_emb_dir
+            )
+            xyz_dim = 6 * hparams.N_emb_xyz + 3
+            dir_dim = 6 * hparams.N_emb_dir + 3
+        else:
+            # will set these in `setup` function
+            self.embedding_xyz = HashEmbedder(bounding_box=self.train_dataset.bounding_box, \
+                                              log2_hashmap_size=19, \
+                                              finest_resolution=1024)
+            self.embedding_xyz_c = HashEmbedder(bounding_box=self.train_dataset.bounding_box_c, \
+                                              log2_hashmap_size=19, \
+                                              finest_resolution=1024)
+            self.embedding_dir = SHEncoder()
+            xyz_dim = self.embedding_xyz.out_dim
+            dir_dim = self.embedding_dir.out_dim
+            self.models_to_train += [self.embedding_xyz, self.embedding_xyz_c]
 
         self.embeddings = {
             "xyz": self.embedding_xyz,
+            "xyz_c": self.embedding_xyz_c,
             "dir": self.embedding_dir,
         }
 
@@ -53,18 +85,20 @@ class NeuralDiffSystem(pytorch_lightning.LightningModule):
         self.embeddings["a"] = self.embedding_a
         self.models_to_train += [self.embedding_a]
 
+        pdb.set_trace()
+
         self.nerf_coarse = model.NeuralDiff(
             "coarse",
-            in_channels_xyz=6 * hparams.N_emb_xyz + 3,
-            in_channels_dir=6 * hparams.N_emb_dir + 3,
+            in_channels_xyz=xyz_dim,
+            in_channels_dir=dir_dim,
             W=hparams.model_width,
         )
         self.models = {"coarse": self.nerf_coarse}
         if hparams.N_importance > 0:
             self.nerf_fine = model.NeuralDiff(
                 "fine",
-                in_channels_xyz=6 * hparams.N_emb_xyz + 3,
-                in_channels_dir=6 * hparams.N_emb_dir + 3,
+                in_channels_xyz=xyz_dim,
+                in_channels_dir=dir_dim,
                 encode_dynamic=True,
                 in_channels_a=hparams.N_a,
                 in_channels_t=hparams.N_tau,
@@ -267,6 +301,8 @@ def init_trainer(hparams, logger=None, checkpoint_callback=None):
         benchmark=True,
         limit_train_batches=hparams.train_ratio,
         profiler="simple" if hparams.num_gpus == 1 else None,
+        callbacks=[ValEveryNSteps(1000)],
+        check_val_every_n_epoch=float('inf')
     )
 
     return trainer
@@ -279,5 +315,6 @@ def main(hparams):
 
 
 if __name__ == "__main__":
+    # torch.set_default_tensor_type('torch.cuda.FloatTensor')
     hparams = get_opts()
     main(hparams)

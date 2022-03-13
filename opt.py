@@ -115,6 +115,12 @@ def get_opts(vid=None, root="data/EPIC-Diff"):
         action="store_true",
         help="For compatibility with evaluation script.",
     )
+    parser.add_argument(
+        "--use_hash",
+        default=False,
+        action="store_true",
+        help="Use hash encoding",
+    )
 
     hparams, unknown = parser.parse_known_args()
     if unknown:

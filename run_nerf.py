@@ -173,7 +173,7 @@ def render_path(render_poses, render_frame_idxs, hwf, K, chunk, render_kwargs, g
     rgbs = []
     disps = []
     uncertainty_maps = []
-
+    psnrs = []
     t = time.time()
     for i, c2w in enumerate(tqdm(render_poses)):
         print(i, time.time() - t)
@@ -189,11 +189,14 @@ def render_path(render_poses, render_frame_idxs, hwf, K, chunk, render_kwargs, g
         if i==0:
             print(rgb.shape, disp.shape)
 
-        """
         if gt_imgs is not None and render_factor==0:
-            p = -10. * np.log10(np.mean(np.square(rgb.cpu().numpy() - gt_imgs[i])))
+            try:
+                gt_img = gt_imgs[i].cpu().numpy()
+            except:
+                gt_img = gt_imgs[i]
+            p = -10. * np.log10(np.mean(np.square(rgb.cpu().numpy() - gt_img)))
             print(p)
-        """
+            psnrs.append(p)
 
         if savedir is not None:
             rgb8 = to8b(rgbs[-1])
@@ -210,6 +213,11 @@ def render_path(render_poses, render_frame_idxs, hwf, K, chunk, render_kwargs, g
     disps = np.stack(disps, 0)
     if uncertainty_maps:
         uncertainty_maps = np.stack(uncertainty_maps, 0)
+    if gt_imgs is not None and render_factor==0:
+        avg_psnr = sum(psnrs)/len(psnrs)
+        print("Avg PSNR over Test set: ", avg_psnr)
+        with open(os.path.join(savedir, "test_psnrs_avg{:0.2f}.pkl".format(avg_psnr)), "wb") as fp:
+            pickle.dump(psnrs, fp)
 
     return rgbs, disps, uncertainty_maps
 
@@ -751,6 +759,7 @@ def train():
 
     if args.dataset_type=="epic_kitchens":
         images, poses, hwf, i_split, bounding_box, bounding_box_incameraframe, near_far, all_frame_idxs = load_epic_kitchens_data(args.datadir)
+        pdb.set_trace()
         near, far = near_far
         
         args.bounding_box = bounding_box
