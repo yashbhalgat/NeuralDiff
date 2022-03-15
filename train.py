@@ -2,18 +2,22 @@ from gc import callbacks
 import os
 from collections import defaultdict
 
+import matplotlib
+matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 import pytorch_lightning
 import torch
 from torch.optim import Adam
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, ExponentialLR
 from torch.utils.data import DataLoader
 import pdb
+from pathlib import Path
 
 import dataset
 import model
 import utils
 from evaluation.metrics import *
+from evaluation import segmentation
 from loss import Loss
 from opt import get_opts
 from utils import *
@@ -43,6 +47,7 @@ class NeuralDiffSystem(pytorch_lightning.LightningModule):
         self.loss = Loss()
 
         self.models_to_train = []
+        self.embeddings_to_train = []
         
         if not self.hparams.use_hash:
             self.embedding_xyz = model.PosEmbedding(
@@ -67,7 +72,7 @@ class NeuralDiffSystem(pytorch_lightning.LightningModule):
             self.embedding_dir = SHEncoder()
             xyz_dim = self.embedding_xyz.out_dim
             dir_dim = self.embedding_dir.out_dim
-            self.models_to_train += [self.embedding_xyz, self.embedding_xyz_c]
+            self.embeddings_to_train += [self.embedding_xyz, self.embedding_xyz_c]
 
         self.embeddings = {
             "xyz": self.embedding_xyz,
@@ -85,26 +90,48 @@ class NeuralDiffSystem(pytorch_lightning.LightningModule):
         self.embeddings["a"] = self.embedding_a
         self.models_to_train += [self.embedding_a]
 
-        pdb.set_trace()
-
-        self.nerf_coarse = model.NeuralDiff(
-            "coarse",
-            in_channels_xyz=xyz_dim,
-            in_channels_dir=dir_dim,
-            W=hparams.model_width,
-        )
-        self.models = {"coarse": self.nerf_coarse}
-        if hparams.N_importance > 0:
-            self.nerf_fine = model.NeuralDiff(
-                "fine",
+        if self.hparams.use_hash:
+            self.nerf_coarse = model.NeuralDiff(
+                "coarse",
                 in_channels_xyz=xyz_dim,
                 in_channels_dir=dir_dim,
-                encode_dynamic=True,
-                in_channels_a=hparams.N_a,
-                in_channels_t=hparams.N_tau,
-                beta_min=hparams.beta_min,
+                W=128,
+                D=4,
+                skips=[2],
+            )
+        else:
+            self.nerf_coarse = model.NeuralDiff(
+                "coarse",
+                in_channels_xyz=xyz_dim,
+                in_channels_dir=dir_dim,
                 W=hparams.model_width,
             )
+        self.models = {"coarse": self.nerf_coarse}
+        if hparams.N_importance > 0:
+            if self.hparams.use_hash:
+                self.nerf_fine = model.NeuralDiff(
+                    "fine",
+                    in_channels_xyz=xyz_dim,
+                    in_channels_dir=dir_dim,
+                    encode_dynamic=True,
+                    in_channels_a=hparams.N_a,
+                    in_channels_t=hparams.N_tau,
+                    beta_min=hparams.beta_min,
+                    W=128,
+                    D=4,
+                    skips=[2],
+                )
+            else:
+                self.nerf_fine = model.NeuralDiff(
+                    "fine",
+                    in_channels_xyz=xyz_dim,
+                    in_channels_dir=dir_dim,
+                    encode_dynamic=True,
+                    in_channels_a=hparams.N_a,
+                    in_channels_t=hparams.N_tau,
+                    beta_min=hparams.beta_min,
+                    W=hparams.model_width,
+                )
             self.models["fine"] = self.nerf_fine
         self.models_to_train += [self.models]
 
@@ -148,17 +175,23 @@ class NeuralDiffSystem(pytorch_lightning.LightningModule):
             self.val_dataset = dataset.EPICDiff(split="val", **kwargs)
 
     def configure_optimizers(self):
-        eps = 1e-8
-        self.optimizer = Adam(
-            get_parameters(self.models_to_train),
-            lr=self.hparams.lr,
-            eps=eps,
-            weight_decay=self.hparams.weight_decay,
+        self.optimizer = Adam([
+            {'params': get_parameters(self.models_to_train), 'weight_decay': self.hparams.weight_decay},
+            {'params': get_parameters(self.embeddings_to_train), 'eps': 1e-15}
+            ], lr=self.hparams.lr
         )
-        scheduler = CosineAnnealingLR(
-            self.optimizer, T_max=self.hparams.num_epochs, eta_min=eps
-        )
-        return [self.optimizer], [scheduler]
+        # scheduler = CosineAnnealingLR(
+        #     self.optimizer, T_max=self.hparams.num_epochs, eta_min=eps
+        # )
+        # return [self.optimizer], [scheduler]
+        return {
+            "optimizer": self.optimizer,
+            "lr_scheduler": {
+                "scheduler": ExponentialLR(self.optimizer, gamma=0.01**(1/50000), verbose=True),
+                "interval": "step",
+                "frequency": 1
+            },
+        }
 
     def train_dataloader(self):
         return DataLoader(
@@ -233,15 +266,16 @@ class NeuralDiffSystem(pytorch_lightning.LightningModule):
         loss = sum(l for l in loss_d.values())
         log = {"val_loss": loss}
 
+        WH = batch["img_wh"].view(1, 2)
+        W, H = WH[0, 0].item(), WH[0, 1].item()
+        img = (
+            results["rgb_fine"].view(H, W, 3)[:, :, :3].permute(2, 0, 1).cpu()
+        )  # (3, H, W)
+        img_gt = rgbs.view(H, W, 3).permute(2, 0, 1).cpu()  # (3, H, W)
+        depth = visualize_depth(results["depth_fine"].view(H, W))  # (3, H, W)
+        stack = torch.stack([img_gt, img, depth])  # (3, 3, H, W)
+
         if batch_nb == 0:
-            WH = batch["img_wh"].view(1, 2)
-            W, H = WH[0, 0].item(), WH[0, 1].item()
-            img = (
-                results["rgb_fine"].view(H, W, 3)[:, :, :3].permute(2, 0, 1).cpu()
-            )  # (3, H, W)
-            img_gt = rgbs.view(H, W, 3).permute(2, 0, 1).cpu()  # (3, H, W)
-            depth = visualize_depth(results["depth_fine"].view(H, W))  # (3, H, W)
-            stack = torch.stack([img_gt, img, depth])  # (3, 3, H, W)
             if self.logger is not None:
                 self.logger.experiment.add_images(
                     "val/GT_pred_depth", stack, self.global_step
@@ -249,17 +283,24 @@ class NeuralDiffSystem(pytorch_lightning.LightningModule):
 
         psnr_ = psnr(results["rgb_fine"], rgbs)
         log["val_psnr"] = psnr_
+        
         if is_debug:
             # then visualise in jupyter
             log["images"] = stack
             log["results"] = results
 
-            f, p = plt.subplots(1, 3, figsize=(15, 15))
-            for i in range(3):
-                im = stack[i]
-                p[i].imshow(im.permute(1, 2, 0).cpu())
-                p[i].axis("off")
-            plt.show()
+        if self.global_step>0:
+            # f, p = plt.subplots(1, 3, figsize=(15, 15))
+            # for i in range(3):
+            #     im = stack[i]
+            #     p[i].imshow(im.permute(1, 2, 0).cpu())
+            #     p[i].axis("off")
+            # # plt.show()
+            results_seg = segmentation.evaluate_sample(self.val_dataset, batch_nb, t=ts[0], model=self, visualise=True, save=True)
+            save_dir = os.path.join("ckpts/"+hparams.exp_name, "val_"+str(self.global_step))
+            Path(save_dir).mkdir(parents=True, exist_ok=True)
+            # plt.savefig(os.path.join(save_dir, str(ts[0].item())+".png"), bbox_inches='tight')
+            results_seg["figure"].savefig(os.path.join(save_dir, str(ts[0].item())+".png"), bbox_inches='tight')
 
         return log
 
@@ -309,6 +350,9 @@ def init_trainer(hparams, logger=None, checkpoint_callback=None):
 
 
 def main(hparams):
+    hparams.exp_name = hparams.vid+"/"
+    if hparams.use_hash:
+        hparams.exp_name += "hashenc_difflr"+str(hparams.lr)
     system = NeuralDiffSystem(hparams)
     trainer = init_trainer(hparams)
     trainer.fit(system)

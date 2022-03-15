@@ -156,7 +156,7 @@ class EPICDiff(Dataset):
             return len(self.rays)
         if self.split == "val":
             # evaluate only one image, sampled from val img ids
-            return 1
+            return len(self.img_ids_val)
         else:
             # choose any image index
             return max(self.img_ids)
@@ -173,8 +173,9 @@ class EPICDiff(Dataset):
 
         elif self.split == "val":
             # for tuning hyperparameters, tensorboard samples
-            idx = random.choice(self.img_ids_val)
-            sample = self.rays_per_image(idx, pose)
+            # idx = random.choice(self.img_ids_val)
+            # sample = self.rays_per_image(idx, pose)
+            sample = self.rays_per_image(self.img_ids_val[idx], pose)
 
         elif self.split == "test":
             # evaluating according to table in paper, chosen index must be in test ids
