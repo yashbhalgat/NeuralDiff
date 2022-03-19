@@ -8,7 +8,9 @@ import pdb
 from hash_encoding import HashEmbedder, SHEncoder, XYZplusT_HashEmbedder
 
 # Misc
+
 img2mse = lambda x, y : torch.mean((x - y) ** 2)
+img2L1 = lambda x, y : torch.mean(0.01 * (torch.sqrt(1 + ((x-y)**2).sum(dim=-1)/0.0001) - 1))
 img2mse_with_uncertainty = lambda x, y, u : torch.mean(((x - y) ** 2)/(2*(u+1e-9)**2) + torch.log((u+1e-9)**2))
 mse2psnr = lambda x : -10. * torch.log(x) / torch.log(torch.Tensor([10.]))
 to8b = lambda x : (255*np.clip(x,0,1)).astype(np.uint8)
@@ -503,7 +505,8 @@ class NeuralDiff(nn.Module):
                  use_uncertainties=False,
                  world_grid_embed=None, camera_grid_embed=None, time_grid_embed=None,
                  big=False,
-                 coarse=True):
+                 coarse=True,
+                 small_actor_MLP=True):
         super(NeuralDiff, self).__init__()
 
         self.input_ch, self.input_cam_ch = input_ch, input_cam_ch # it's raw xyzt, so input_ch=4
@@ -511,7 +514,8 @@ class NeuralDiff(nn.Module):
 
         self.num_layers, self.num_layers_color, self.hidden_dim = num_layers+2*big, num_layers_color+2*big, hidden_dim
         self.geo_feat_dim = geo_feat_dim
-        self.num_layers_FG, self.num_layers_ACTOR = num_layers_FG+2*big, num_layers_ACTOR+2*big
+        self.num_layers_FG, self.num_layers_ACTOR = num_layers_FG, num_layers_ACTOR
+        self.small_actor_MLP = small_actor_MLP
         if coarse:
             self.use_uncertainties = False
         else:
@@ -556,8 +560,8 @@ class NeuralDiff(nn.Module):
             ### Actor Network
             ACTOR_net = []
             for l in range(num_layers_ACTOR):
-                in_dim = camera_grid_embed.out_dim + time_grid_embed.out_dim if l == 0 else hidden_dim*(self.big+1)
-                out_dim = 3 + 1 + 1 if l==num_layers_ACTOR-1 else hidden_dim*(self.big+1)  # 3 rgb_ACTOR + 1 sigma_ACTOR + 1 uncertainty_ACTOR
+                in_dim = camera_grid_embed.out_dim + time_grid_embed.out_dim if l == 0 else hidden_dim*(2-self.small_actor_MLP)
+                out_dim = 3 + 1 + 1 if l==num_layers_ACTOR-1 else hidden_dim*(2-self.small_actor_MLP)  # 3 rgb_ACTOR + 1 sigma_ACTOR + 1 uncertainty_ACTOR
                 ACTOR_net.append(nn.Linear(in_dim, out_dim, bias=False))
                 if l!=num_layers_ACTOR-1:
                     ACTOR_net.append(nn.ReLU())
@@ -565,27 +569,33 @@ class NeuralDiff(nn.Module):
     
     def forward(self, x):
         input_pts, input_pts_cam, input_views, input_views_cam = torch.split(x, [self.input_ch, self.input_cam_ch, self.input_ch_views, self.input_ch_views_cam], dim=-1)
-        embedded_xyz = self.world_grid_embed(input_pts[...,:3])
+        embedded_xyz, keep_mask = self.world_grid_embed(input_pts[...,:3])
         if not self.coarse:
             embedded_time = self.time_grid_embed(input_pts[...,3].unsqueeze(-1))
-            embedded_xyz_cam = self.camera_grid_embed(input_pts_cam[...,:3])
+            embedded_xyz_cam, keep_mask_cam = self.camera_grid_embed(input_pts_cam[...,:3])
 
         ### Static components
         h = self.BG_sigma_net(embedded_xyz)
         BG_sigma, ray_encoding = h[..., 0], h[..., 1:]
         BG_color = self.BG_color_net(torch.cat([input_views, ray_encoding], dim=-1))
+        BG_color = F.sigmoid(BG_color)
         BG_sigma = relu_act(BG_sigma)
+        BG_sigma, BG_color = BG_sigma*keep_mask, BG_color*keep_mask[:,None]
 
         ### Dynamic components
         if not self.coarse:
             h = self.FG_net(torch.cat([embedded_time, ray_encoding], dim=-1))
             FG_color, FG_sigma, FG_uncertainties = h[..., :3], h[..., 3], h[..., 4]
-            
+            FG_color = F.sigmoid(FG_color)
+
             h = self.ACTOR_net(torch.cat([embedded_xyz_cam, embedded_time], dim=-1))
             ACTOR_color, ACTOR_sigma, ACTOR_uncertainties = h[..., :3], h[..., 3], h[..., 4]
+            ACTOR_color = F.sigmoid(ACTOR_color)
 
             FG_sigma, FG_uncertainties = relu_act(FG_sigma), relu_act(FG_uncertainties)
             ACTOR_sigma, ACTOR_uncertainties = relu_act(ACTOR_sigma), relu_act(ACTOR_uncertainties)
+            FG_sigma, FG_color = FG_sigma*keep_mask, FG_color*keep_mask[:,None]
+            ACTOR_sigma, ACTOR_color = ACTOR_sigma*keep_mask_cam, ACTOR_color*keep_mask_cam[:,None]
         else:
             FG_sigma, FG_color, FG_uncertainties = torch.zeros_like(BG_sigma), torch.zeros_like(BG_color), None
             ACTOR_sigma, ACTOR_color, ACTOR_uncertainties = torch.zeros_like(BG_sigma), torch.zeros_like(BG_color), None
@@ -595,11 +605,9 @@ class NeuralDiff(nn.Module):
         color = (BG_sigma/sigma)[:,None] * BG_color + (FG_sigma/sigma)[:,None] * FG_color + (ACTOR_sigma/sigma)[:,None] * ACTOR_color
 
         if self.use_uncertainties:
-            return torch.cat([color, sigma.unsqueeze(dim=-1), \
-                                FG_uncertainties.unsqueeze(dim=-1), \
-                                FG_sigma.unsqueeze(dim=-1), \
-                                ACTOR_uncertainties.unsqueeze(dim=-1), \
-                                ACTOR_sigma.unsqueeze(dim=-1)], -1)
+            return torch.cat([BG_color, FG_color, ACTOR_color, # :3, 3:6, 6:9
+                                BG_sigma.unsqueeze(dim=-1), FG_sigma.unsqueeze(dim=-1), ACTOR_sigma.unsqueeze(dim=-1), # 9, 10, 11
+                                FG_uncertainties.unsqueeze(dim=-1), ACTOR_uncertainties.unsqueeze(dim=-1)], -1) # 12, 13
         else:
             return torch.cat([color, sigma.unsqueeze(dim=-1)], -1)
 

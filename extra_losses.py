@@ -39,13 +39,14 @@ def total_variation_loss_1D(embeddings, min_resolution, max_resolution, level, l
     b = exp((log(max_resolution)-log(min_resolution))/(n_levels-1))
     resolution = torch.tensor(floor(min_resolution * b**level))
 
-    # Cube size to apply TV loss
-    min_bin_size = min_resolution - 1
-    max_bin_size = 50 # can be tuned
-    if min_bin_size > max_bin_size:
-        print("ALERT! min cuboid size greater than max!")
-        pdb.set_trace()
-    bin_size = torch.floor(torch.clip(resolution/10.0, min_bin_size, max_bin_size)).int()
+    # # Cube size to apply TV loss
+    # min_bin_size = min_resolution - 1
+    # max_bin_size = 50 # can be tuned
+    # if min_bin_size > max_bin_size:
+    #     print("ALERT! min cuboid size greater than max!")
+    #     pdb.set_trace()
+    # bin_size = torch.floor(torch.clip(resolution/10.0, min_bin_size, max_bin_size)).int()
+    bin_size = resolution - 1
 
     # Sample bin
     min_vertex = torch.randint(0, resolution-bin_size, (1,))

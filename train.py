@@ -180,18 +180,20 @@ class NeuralDiffSystem(pytorch_lightning.LightningModule):
             {'params': get_parameters(self.embeddings_to_train), 'eps': 1e-15}
             ], lr=self.hparams.lr
         )
-        # scheduler = CosineAnnealingLR(
-        #     self.optimizer, T_max=self.hparams.num_epochs, eta_min=eps
-        # )
-        # return [self.optimizer], [scheduler]
-        return {
-            "optimizer": self.optimizer,
-            "lr_scheduler": {
-                "scheduler": ExponentialLR(self.optimizer, gamma=0.01**(1/50000), verbose=True),
-                "interval": "step",
-                "frequency": 1
-            },
-        }
+        if not self.hparams.use_hash:
+            scheduler = CosineAnnealingLR(
+                self.optimizer, T_max=self.hparams.num_epochs, eta_min=1e-8
+            )
+            return [self.optimizer], [scheduler]
+        else:
+            return {
+                "optimizer": self.optimizer,
+                "lr_scheduler": {
+                    "scheduler": ExponentialLR(self.optimizer, gamma=0.01**(1/50000), verbose=True),
+                    "interval": "step",
+                    "frequency": 1
+                },
+            }
 
     def train_dataloader(self):
         return DataLoader(
@@ -342,8 +344,8 @@ def init_trainer(hparams, logger=None, checkpoint_callback=None):
         benchmark=True,
         limit_train_batches=hparams.train_ratio,
         profiler="simple" if hparams.num_gpus == 1 else None,
-        callbacks=[ValEveryNSteps(1000)],
-        check_val_every_n_epoch=float('inf')
+        callbacks=[ValEveryNSteps(1000)] if hparams.use_hash else [],
+        check_val_every_n_epoch=float('inf') if hparams.use_hash else 1
     )
 
     return trainer
@@ -353,6 +355,8 @@ def main(hparams):
     hparams.exp_name = hparams.vid+"/"
     if hparams.use_hash:
         hparams.exp_name += "hashenc_difflr"+str(hparams.lr)
+    else:
+        hparams.exp_name += "freq_lr"+str(hparams.lr)
     system = NeuralDiffSystem(hparams)
     trainer = init_trainer(hparams)
     trainer.fit(system)
