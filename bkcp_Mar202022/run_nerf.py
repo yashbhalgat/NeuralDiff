@@ -26,7 +26,6 @@ from radam import RAdam
 from extra_losses import sigma_sparsity_loss, total_variation_loss_3D, total_variation_loss_1D
 from hash_encoding import HashEmbedder, XYZplusT_HashEmbedder, Linear_HashEmbedder
 from robust_loss_pytorch.adaptive import AdaptiveLossFunction
-from robust_loss_pytorch.general import lossfun
 
 from load_epic_kitchens import load_epic_kitchens_data
 
@@ -119,10 +118,14 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ego_c2w=None, time_coord
         assert ego_c2w is not None, "I need the EGO pose for actor model!"
         
         c2c = torch.zeros_like(ego_c2w)
-        # c2c[:3,:3] = ego_c2w[:3,:3].t() @ c2w[:3,:3]
-        # c2c[:3,-1] = ego_c2w[:3,:3].t() @ (c2w[:3,-1]-ego_c2w[:3,-1])
-        c2c[:3,:3] = torch.eye(3,3).to(ego_c2w.device)
+        c2c[:3,:3] = ego_c2w[:3,:3].t() @ c2w[:3,:3]
+        c2c[:3,-1] = ego_c2w[:3,:3].t() @ (c2w[:3,-1]-ego_c2w[:3,-1])
         rays_o_cam, rays_d_cam = get_rays(H, W, K, c2c)
+
+        c2c_org = torch.zeros_like(ego_c2w)
+        c2c_org[:3,:3] = torch.eye(3,3).to(ego_c2w.device)
+        o_cam, d_cam = get_rays(H, W, K, c2c_org)
+        pdb.set_trace()
 
         if time_coord is None:
             pdb.set_trace()
@@ -140,7 +143,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ego_c2w=None, time_coord
         viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True)
         viewdirs = torch.reshape(viewdirs, [-1,3]).float()
 
-        viewdirs_cam = rays_d_cam
+        viewdirs_cam = d_cam
         viewdirs_cam = viewdirs_cam / torch.norm(viewdirs_cam, dim=-1, keepdim=True)
         viewdirs_cam = torch.reshape(viewdirs_cam, [-1,3]).float()
 
@@ -184,8 +187,6 @@ def render_video(render_poses, fixed_pose_idx, render_frame_idxs, hwf, K, chunk,
     psnrs = []
     t = time.time()
     for i, c2w in enumerate(tqdm(render_poses)):
-        if i<30 or i%2==0:
-            continue
         print(i, time.time() - t)
         t = time.time()
 
@@ -210,42 +211,52 @@ def render_video(render_poses, fixed_pose_idx, render_frame_idxs, hwf, K, chunk,
         p[0,0].set_ylabel("Ego Viewpoint", fontdict={"fontsize":15}, rotation='horizontal', ha='right')
         p[0,0].set_xlabel("Ground Truth", fontdict={"fontsize":15})
         p[0,0].xaxis.set_label_position('top') 
-        
+        # p[0,0].axis("off")
+
+
         p[0,1].imshow(to8b(rgb.cpu().numpy()))
         p[0,1].set_xlabel("Composite", fontdict={"fontsize":15})
         p[0,1].xaxis.set_label_position('top')
-        
+        # p[0,1].axis("off")
+
         p[0,2].imshow(to8b(extras["BG_rgb_map"].cpu().numpy()))
         p[0,2].set_xlabel("Static", fontdict={"fontsize":15})
         p[0,2].xaxis.set_label_position('top')
-        
+        # p[0,2].axis("off")
+
         p[0,3].imshow(to8b(extras["FG_rgb_map"].cpu().numpy()))
         p[0,3].set_xlabel("Transient", fontdict={"fontsize":15})
         p[0,3].xaxis.set_label_position('top')
-        
+        # p[0,3].axis("off")
+
         p[0,4].imshow(to8b(extras["ACTOR_rgb_map"].cpu().numpy()))
         p[0,4].set_xlabel("Actor", fontdict={"fontsize":15})
         p[0,4].xaxis.set_label_position('top')
-        
+        # p[0,4].axis("off")
+
         p[1,0].axis("off")
 
         p[1,1].imshow(to8b(fixed_rgb.cpu().numpy()))
         p[1,1].set_ylabel("Fixed Viewpoint", fontdict={"fontsize":15}, rotation='horizontal', ha='right')
         p[1,1].set_xlabel("Composite", fontdict={"fontsize":15})
         p[1,1].xaxis.set_label_position('top')
-        
+        # p[1,1].axis("off")
+
         p[1,2].imshow(to8b(fixed_extras["BG_rgb_map"].cpu().numpy()))
         p[1,2].set_xlabel("Static", fontdict={"fontsize":15})
         p[1,2].xaxis.set_label_position('top')
-        
+        # p[1,2].axis("off")
+
         p[1,3].imshow(to8b(fixed_extras["FG_rgb_map"].cpu().numpy()))
         p[1,3].set_xlabel("Transient", fontdict={"fontsize":15})
         p[1,3].xaxis.set_label_position('top')
+        # p[1,3].axis("off")
         
         p[1,4].imshow(to8b(fixed_extras["ACTOR_rgb_map"].cpu().numpy()))
         p[1,4].set_xlabel("Actor", fontdict={"fontsize":15})
         p[1,4].xaxis.set_label_position('top')
-        
+        # p[1,4].axis("off")
+
         for r in range(2):
             for c in range(5):
                 p[r,c].set_xticklabels([])
@@ -253,10 +264,9 @@ def render_video(render_poses, fixed_pose_idx, render_frame_idxs, hwf, K, chunk,
                 p[r,c].set_xticks([])
                 p[r,c].set_yticks([])
         f.savefig(os.path.join(savedir, '{:03d}_combined.png'.format(int(render_frame_idxs[i]))), bbox_inches='tight')
-
+        
         numpy_fig = mplfig_to_npimage(f)
         numpy_figs.append(numpy_fig)
-        plt.close()
 
 
     numpy_figs = np.stack(numpy_figs, 0)
@@ -335,7 +345,6 @@ def render_path(render_poses, render_frame_idxs, hwf, K, chunk, render_kwargs, g
                 p[1,2].axis("off")
                 p[1,2].title.set_text("Actor")
                 f.savefig(os.path.join(savedir, '{:03d}_combined.png'.format(int(render_frame_idxs[i]))), bbox_inches='tight')
-                plt.close(f)
 
 
     rgbs = np.stack(rgbs, 0)
@@ -374,12 +383,12 @@ def create_nerf(args):
     
     ### DEFINING THE FOUNDATIONAL BLOCKS
     world_grid_embed = HashEmbedder(bounding_box=xyz_bounding_box, \
-                        n_features_per_level=4 if args.big_world_embed else 2, \
+                        n_features_per_level=4 if args.big_embeds else 2,
                         log2_hashmap_size=args.log2_hashmap_size, \
                         finest_resolution=args.finest_res)
     world_grid_embed_FG = None
     camera_grid_embed = HashEmbedder(bounding_box=xyz_bounding_box_cam, \
-                        n_levels=4 if args.actor_small_embed else 16,
+                        n_features_per_level=4 if args.big_embeds else 2,
                         base_resolution=128 if args.actor_high_freq else 16,
                         log2_hashmap_size=args.log2_hashmap_size, \
                         finest_resolution=args.finest_res)
@@ -467,11 +476,8 @@ def create_nerf(args):
                                                                 netchunk=args.netchunk)
 
     ### Define adaptive robust loss
-    if args.fixed_adaptive_loss:
-        adaptive_loss = AdaptiveLossFunction(num_dims=3, float_dtype=torch.float32, device=torch.device("cuda:0"))
-        grad_vars += list(adaptive_loss.parameters())
-    else:
-        None
+    adaptive_loss = AdaptiveLossFunction(num_dims=3, float_dtype=torch.float32, device=torch.device("cuda:0"))
+    grad_vars += list(adaptive_loss.parameters())
 
     # Create optimizer
     if args.i_embed==1:
@@ -539,8 +545,7 @@ def create_nerf(args):
         'embedders': {'world_grid_embed': world_grid_embed, \
                       'world_grid_embed_FG': world_grid_embed_FG, \
                       'camera_grid_embed': camera_grid_embed, \
-                      'time_grid_embed': time_grid_embed},
-        'sigma_cauchy': args.sigma_cauchy
+                      'time_grid_embed': time_grid_embed}
     }
 
     # NDC only good for LLFF-style forward facing data
@@ -552,7 +557,6 @@ def create_nerf(args):
     render_kwargs_test = {k : render_kwargs_train[k] for k in render_kwargs_train}
     render_kwargs_test['perturb'] = False
     render_kwargs_test['raw_noise_std'] = 0.
-    render_kwargs_test['test_time'] = True # if "test_time" in render_kwargs_test, then you are in testing mode
 
     return render_kwargs_train, render_kwargs_test, start, adaptive_loss, optimizer
 
@@ -563,7 +567,7 @@ def get_weights_from_sigmas(sigmas, dists, noise=0.0):
     return weights
 
 
-def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False, test_time=False, coarse=False, sigma_cauchy=False):
+def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False):
     """Transforms model's predictions to semantically meaningful values.
     Args:
         raw: [num_rays, num_samples along ray, 4]. Prediction from model.
@@ -600,67 +604,44 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
         FG_rgb = raw[...,3:6]
         ACTOR_rgb = raw[...,6:9]
         BG_sigma, FG_sigma, ACTOR_sigma = raw[...,9], raw[...,10], raw[...,11]
-        
-        if not test_time and not coarse: ## same as "if training time and if using model_fine"
-            BG_sigma[:, -1:] = 1000
-            BG_rgb[:, -1, :3] = torch.rand(BG_rgb.shape[0], 3).to(BG_rgb.device)
-
         sigma = BG_sigma + FG_sigma + ACTOR_sigma + 1e-9
         rgb = (BG_sigma/sigma)[...,None] * BG_rgb + (FG_sigma/sigma)[...,None] * FG_rgb + (ACTOR_sigma/sigma)[...,None] * ACTOR_rgb
 
     # overall rgb map
-    alphas = 1.-torch.exp(-F.relu(sigma + noise)*dists)
-    transmittance = torch.cumprod(torch.cat([torch.ones((alphas.shape[0], 1)), 1.-alphas + 1e-10], -1), -1)[:, :-1]
-    weights = alphas * transmittance
+    weights = get_weights_from_sigmas(sigma, dists, noise)
     rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3]
 
-    # background, foreground and actor weights
+    # individual rgb maps
     if raw.shape[-1] > 4:
-        BG_alphas = (BG_sigma/sigma)*alphas
-        BG_alphas[:,-1:] = 1.-torch.exp(-F.relu(BG_sigma + noise)*dists)[:,-1:]
-        FG_alphas = (FG_sigma/sigma)*alphas
-        FG_alphas[:,-1:] = 1.-torch.exp(-F.relu(FG_sigma + noise)*dists)[:,-1:]
-        ACTOR_alphas = (ACTOR_sigma/sigma)*alphas
-        ACTOR_alphas[:,-1:] = 1.-torch.exp(-F.relu(ACTOR_sigma + noise)*dists)[:,-1:]
-
-        if test_time: 
-            BG_weights = BG_alphas * torch.cumprod(torch.cat([torch.ones((BG_alphas.shape[0], 1)), 1.-BG_alphas + 1e-10], -1), -1)[:, :-1]
-            # FG_weights = FG_alphas * torch.cumprod(torch.cat([torch.ones((FG_alphas.shape[0], 1)), 1.-FG_alphas + 1e-10], -1), -1)[:, :-1]
-            # ACTOR_weights = ACTOR_alphas * torch.cumprod(torch.cat([torch.ones((ACTOR_alphas.shape[0], 1)), 1.-ACTOR_alphas + 1e-10], -1), -1)[:, :-1]
-            ### Hacky. Must remove in future!
-            FG_weights = FG_alphas * transmittance 
-            ACTOR_weights = ACTOR_alphas * transmittance
-        else:
-            BG_weights = BG_alphas * transmittance
-            FG_weights = FG_alphas * transmittance
-            ACTOR_weights = ACTOR_alphas * transmittance
+        background_weights = (BG_sigma/sigma)*weights
+        foreground_weights = (FG_sigma/sigma)*weights
+        actor_weights = (ACTOR_sigma/sigma)*weights
 
     uncertainty_map = None
-    if raw.shape[-1] > 4 and not test_time:
+    if raw.shape[-1] > 4:
         foreground_uncertainty = F.relu(raw[..., 12])
         if raw.shape[-1] > 5:
-            uncertainty_map = torch.sum(FG_weights * foreground_uncertainty, -1)
+            uncertainty_map = torch.sum(foreground_weights * foreground_uncertainty, -1)
             if raw.shape[-1] > 6:
                 actor_uncertainty = F.relu(raw[..., 13])
-                uncertainty_map += torch.sum(ACTOR_weights * actor_uncertainty, -1)
+                uncertainty_map += torch.sum(actor_weights * actor_uncertainty, -1)
         else:
             uncertainty_map = torch.sum(weights * foreground_uncertainty, -1)
         # adding beta_min as in NeRF-W
         uncertainty_map += 0.03
 
     if raw.shape[-1] > 4:        
-        BG_rgb_map = torch.sum(BG_weights[...,None] * BG_rgb, -2)
-        FG_rgb_map = torch.sum(FG_weights[...,None] * FG_rgb, -2)
-        ACTOR_rgb_map = torch.sum(ACTOR_weights[...,None] * ACTOR_rgb, -2)
+        BG_rgb_map = torch.sum(background_weights[...,None] * BG_rgb, -2)
+        FG_rgb_map = torch.sum(foreground_weights[...,None] * FG_rgb, -2)
+        ACTOR_rgb_map = torch.sum(actor_weights[...,None] * ACTOR_rgb, -2)
 
     sigma_L1 = torch.zeros(raw.shape[0])
-    if raw.shape[-1] > 4 and not test_time:
-        if not sigma_cauchy:
-            sigma_L1 += FG_sigma.sum(dim=-1) + ACTOR_sigma.sum(dim=-1) # Just use L1 loss
-        else:
-            sigma_L1 = torch.log(1+20*FG_sigma**2).sum(dim=-1) + torch.log(1+20*ACTOR_sigma**2).sum(dim=-1)
-        # entropy = Categorical(probs = torch.stack([BG_sigma/sigma, FG_sigma/sigma, ACTOR_sigma/sigma], dim=-1) + 1e-8).entropy()
-        # sigma_L1 += entropy.sum(dim=-1)
+    if raw.shape[-1] > 4:
+        sigma_L1 += FG_sigma.sum(dim=-1) + ACTOR_sigma.sum(dim=-1) 
+        # if raw.shape[-1] > 7:
+        #     sigma_L1 += raw[...,7].sum(dim=-1) # actor sigmas
+        entropy = Categorical(probs = torch.stack([BG_sigma/sigma, FG_sigma/sigma, ACTOR_sigma/sigma], dim=-1) + 1e-8).entropy()
+        sigma_L1 += entropy.sum(dim=-1)
 
     depth_map = torch.sum(weights * z_vals, -1)
     disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1))
@@ -691,9 +672,7 @@ def render_rays(ray_batch,
                 white_bkgd=False,
                 raw_noise_std=0.,
                 verbose=False,
-                pytest=False,
-                test_time=False,
-                sigma_cauchy=False):
+                pytest=False):
     """Volumetric rendering.
     Args:
       ray_batch: array of shape [batch_size, ...]. All information necessary
@@ -763,7 +742,7 @@ def render_rays(ray_batch,
 
 #     raw = run_network(pts)
     raw = network_query_fn(pts, pts_cam, viewdirs, viewdirs_cam, network_fn)
-    rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss, uncertainty_map, BG_rgb_map, FG_rgb_map, ACTOR_rgb_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest, test_time=test_time, coarse=network_fn.coarse, sigma_cauchy=sigma_cauchy)
+    rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss, uncertainty_map, BG_rgb_map, FG_rgb_map, ACTOR_rgb_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
     if N_importance > 0:
 
@@ -783,7 +762,7 @@ def render_rays(ray_batch,
 #         raw = run_network(pts, fn=run_fn)
         raw = network_query_fn(pts, pts_cam, viewdirs, viewdirs_cam, run_fn)
 
-        rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss, uncertainty_map, BG_rgb_map, FG_rgb_map, ACTOR_rgb_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest, test_time=test_time, coarse=run_fn.coarse, sigma_cauchy=sigma_cauchy)
+        rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss, uncertainty_map, BG_rgb_map, FG_rgb_map, ACTOR_rgb_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
     ret = {'rgb_map' : rgb_map, 'disp_map' : disp_map, 'acc_map' : acc_map, 'sparsity_loss': sparsity_loss}
     ret["BG_rgb_map"] = BG_rgb_map
@@ -941,18 +920,13 @@ def config_parser():
                         help='use bigger actor and foreground model')
     parser.add_argument("--big-time", action='store_true', 
                         help='use bigger embedding for time')
-    parser.add_argument("--big-world-embed", action='store_true', 
-                        help='use bigger size for world embeddings')
-    parser.add_argument("--actor-small-embed", action='store_true', 
-                        help='Less levels for actor embedding')
+    parser.add_argument("--big-embeds", action='store_true', 
+                        help='Bigger embeddings for xyz embedders')
     parser.add_argument("--small-actor-MLP", action='store_true', 
                         help='Less levels for actor embedding')
     parser.add_argument("--actor-high-freq", action='store_true', 
                         help='high freq for actor embedding')
-    parser.add_argument("--fixed-adaptive-loss", action='store_true', 
-                        help='fixed version of adaptive loss')
-    parser.add_argument("--sigma-cauchy", action='store_true', 
-                        help='Use cauchy loss for sigma values')
+ 
     return parser
 
 
@@ -1009,29 +983,20 @@ def train():
     args.expname += "_fine"+str(args.finest_res) + "_log2T"+str(args.log2_hashmap_size)
     args.expname += "_lr"+str(args.lrate) + "_decay"+str(args.lrate_decay)
     args.expname += "_NeuralDiffsig_CoarseAdapt"
-    if args.fixed_adaptive_loss:
-        args.expname += "Fixed"
     if args.use_uncertainties:
         args.expname += "_withUncert"
     if args.big:
         args.expname += "_BIGGER"
-    args.expname += "_smallBG"
     if args.big_time:
         args.expname += "_BigTime"
-    if args.big_world_embed:
-        args.expname += "_BWor"
     if args.only_background or args.only_foreground:
         args.expname += "_STATIC"
     if args.sparse_loss_weight > 0:
-        if args.sigma_cauchy:
-            args.expname += "_cauchy" + str(args.sparse_loss_weight)# + "_entropy1.0"
-        else:
-            args.expname += "_sparse" + str(args.sparse_loss_weight)# + "_entropy1.0"
-    args.expname += "_TV" + str(args.tv_loss_weight)
+        args.expname += "_sparse" + str(args.sparse_loss_weight) + "_entropy1.0"
+    args.expname += "_TVtimeonly" + str(args.tv_loss_weight)
     args.expname += "_BGFGsame"
-    args.expname += "_BGsignoise"
-    if args.actor_small_embed:
-        args.expname += "_ActSmallEmb"
+    if args.big_embeds:
+        args.expname += "_BigEmb"
     if args.small_actor_MLP:
         args.expname += "_smallActMLP"
     if args.actor_high_freq:
@@ -1094,7 +1059,7 @@ def train():
             # fixed_pose = render_poses[fixed_pose_idx]
             # fixed_poses = fixed_pose.repeat(all_frame_idxs.shape[0], 1, 1) # repeat for number of frames
             
-            videobase = os.path.join(basedir, expname, 'fixedviewpoint_comb_mod_{:04d}_{:06d}'.format(fixed_pose_idx, start))
+            videobase = os.path.join(basedir, expname, 'fixedviewpoint_comb_{:04d}_{:06d}'.format(fixed_pose_idx, start))
             os.makedirs(videobase, exist_ok=True)
             
             sorted_idx = np.argsort(all_frame_idxs)
@@ -1220,10 +1185,7 @@ def train():
             # if 'uncertainty_map0' not in extras:
             # img_loss0 = img2mse(extras['rgb0'], target_s)
             # img_loss0 = img2L1(extras['rgb0'], target_s)
-            if args.fixed_adaptive_loss:
-                img_loss0 = lossfun(extras['rgb0']-target_s, alpha=torch.Tensor([-2.]), scale=torch.Tensor([0.01])).sum(dim=-1).mean()
-            else:
-                img_loss0 = adaptive_loss.lossfun(extras['rgb0']-target_s).sum(dim=-1).mean()
+            img_loss0 = adaptive_loss.lossfun(extras['rgb0']-target_s).sum(dim=-1).mean()
             # else:
             #     img_loss0 = img2mse_with_uncertainty(extras['rgb0'], target_s, extras['uncertainty_map0'].unsqueeze(-1))
             loss = loss + img_loss0
@@ -1243,7 +1205,7 @@ def train():
                     min_res = render_kwargs_train['embedders'][embed].base_resolution
                     max_res = render_kwargs_train['embedders'][embed].finest_resolution
                     log2_hashmap_size = render_kwargs_train['embedders'][embed].log2_hashmap_size
-                    TV_loss += 0.001*sum(total_variation_loss_3D(render_kwargs_train['embedders'][embed].embeddings[i], \
+                    TV_loss += sum(total_variation_loss_3D(render_kwargs_train['embedders'][embed].embeddings[i], \
                                                     min_res, max_res, \
                                                     i, log2_hashmap_size, \
                                                     n_levels=n_levels) for i in range(n_levels))
@@ -1260,8 +1222,8 @@ def train():
                                                 n_levels=n_levels) for i in range(n_levels))
 
                 loss = loss + args.tv_loss_weight * TV_loss
-                # if i>1000:
-                #     args.tv_loss_weight = 0.0
+                if i>1000:
+                    args.tv_loss_weight = 0.0
  
         loss.backward()
         # pdb.set_trace()

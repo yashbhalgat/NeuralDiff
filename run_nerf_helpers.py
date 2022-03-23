@@ -512,7 +512,7 @@ class NeuralDiff(nn.Module):
         self.input_ch, self.input_cam_ch = input_ch, input_cam_ch # it's raw xyzt, so input_ch=4
         self.input_ch_views, self.input_ch_views_cam = input_ch_views, input_ch_views_cam # has embedded views
 
-        self.num_layers, self.num_layers_color, self.hidden_dim = num_layers+2*big, num_layers_color+2*big, hidden_dim
+        self.num_layers, self.num_layers_color, self.hidden_dim = num_layers, num_layers_color, hidden_dim
         self.geo_feat_dim = geo_feat_dim
         self.num_layers_FG, self.num_layers_ACTOR = num_layers_FG, num_layers_ACTOR
         self.small_actor_MLP = small_actor_MLP

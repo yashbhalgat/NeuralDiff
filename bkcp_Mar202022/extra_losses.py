@@ -13,7 +13,7 @@ def total_variation_loss_3D(embeddings, min_resolution, max_resolution, level, l
 
     # Cube size to apply TV loss
     min_cube_size = min_resolution - 1
-    max_cube_size = min_resolution+50 # can be tuned
+    max_cube_size = int((min_resolution*max_resolution)**0.5) # can be tuned
     if min_cube_size > max_cube_size:
         print("ALERT! min cuboid size greater than max!")
         pdb.set_trace()
