@@ -149,57 +149,6 @@ def forward_through_MLP(sigma_net, color_net, embedded_x, embedded_views, \
         return sigma, color, uncertainties
 
 
-# Model
-class NeRF(nn.Module):
-    def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False):
-        """ 
-        """
-        super(NeRF, self).__init__()
-        self.D = D
-        self.W = W
-        self.input_ch = input_ch
-        self.input_ch_views = input_ch_views
-        self.skips = skips
-        self.use_viewdirs = use_viewdirs
-        
-        self.pts_linears = nn.ModuleList(
-            [nn.Linear(input_ch, W)] + [nn.Linear(W, W) if i not in self.skips else nn.Linear(W + input_ch, W) for i in range(D-1)])
-        
-        self.views_linears = nn.ModuleList([nn.Linear(input_ch_views + W, W//2)])
-        
-        if use_viewdirs:
-            self.feature_linear = nn.Linear(W, W)
-            self.alpha_linear = nn.Linear(W, 1)
-            self.rgb_linear = nn.Linear(W//2, 3)
-        else:
-            self.output_linear = nn.Linear(W, output_ch)
-
-    def forward(self, x):
-        input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
-        h = input_pts
-        for i, l in enumerate(self.pts_linears):
-            h = self.pts_linears[i](h)
-            h = F.relu(h)
-            if i in self.skips:
-                h = torch.cat([input_pts, h], -1)
-
-        if self.use_viewdirs:
-            alpha = self.alpha_linear(h)
-            feature = self.feature_linear(h)
-            h = torch.cat([feature, input_views], -1)
-        
-            for i, l in enumerate(self.views_linears):
-                h = self.views_linears[i](h)
-                h = F.relu(h)
-
-            rgb = self.rgb_linear(h)
-            outputs = torch.cat([rgb, alpha], -1)
-        else:
-            outputs = self.output_linear(h)
-
-        return outputs
-
-
 # Small NeRF for Hash embeddings
 class NeRFSmall(nn.Module):
     def __init__(self,
@@ -503,10 +452,9 @@ class NeuralDiff(nn.Module):
                  input_ch=4, input_cam_ch=4,
                  input_ch_views=3, input_ch_views_cam=3,
                  use_uncertainties=False,
-                 world_grid_embed=None, camera_grid_embed=None, time_grid_embed=None,
+                 world_grid_embed=None, world_grid_embed_FG=None, camera_grid_embed=None, time_grid_embed=None,
                  big=False,
-                 coarse=True,
-                 small_actor_MLP=True):
+                 coarse=True):
         super(NeuralDiff, self).__init__()
 
         self.input_ch, self.input_cam_ch = input_ch, input_cam_ch # it's raw xyzt, so input_ch=4
@@ -515,7 +463,6 @@ class NeuralDiff(nn.Module):
         self.num_layers, self.num_layers_color, self.hidden_dim = num_layers, num_layers_color, hidden_dim
         self.geo_feat_dim = geo_feat_dim
         self.num_layers_FG, self.num_layers_ACTOR = num_layers_FG, num_layers_ACTOR
-        self.small_actor_MLP = small_actor_MLP
         if coarse:
             self.use_uncertainties = False
         else:
@@ -560,8 +507,8 @@ class NeuralDiff(nn.Module):
             ### Actor Network
             ACTOR_net = []
             for l in range(num_layers_ACTOR):
-                in_dim = camera_grid_embed.out_dim + time_grid_embed.out_dim if l == 0 else hidden_dim*(2-self.small_actor_MLP)
-                out_dim = 3 + 1 + 1 if l==num_layers_ACTOR-1 else hidden_dim*(2-self.small_actor_MLP)  # 3 rgb_ACTOR + 1 sigma_ACTOR + 1 uncertainty_ACTOR
+                in_dim = camera_grid_embed.out_dim + time_grid_embed.out_dim if l == 0 else hidden_dim*2
+                out_dim = 3 + 1 + 1 if l==num_layers_ACTOR-1 else hidden_dim*2  # 3 rgb_ACTOR + 1 sigma_ACTOR + 1 uncertainty_ACTOR
                 ACTOR_net.append(nn.Linear(in_dim, out_dim, bias=False))
                 if l!=num_layers_ACTOR-1:
                     ACTOR_net.append(nn.ReLU())
@@ -610,6 +557,132 @@ class NeuralDiff(nn.Module):
                                 FG_uncertainties.unsqueeze(dim=-1), ACTOR_uncertainties.unsqueeze(dim=-1)], -1) # 12, 13
         else:
             return torch.cat([color, sigma.unsqueeze(dim=-1)], -1)
+
+
+class NeuralDiff_BGFGSeparate(nn.Module):
+    '''
+    Static Background model uses a low-frequency grid, 
+    and Foreground model uses a high-frequency grid.
+    '''
+    def __init__(self,
+                 num_layers=3,
+                 hidden_dim=64,
+                 geo_feat_dim=15,
+                 num_layers_color=4,
+                 num_layers_FG=4, num_layers_ACTOR=4,
+                 input_ch=4, input_cam_ch=4,
+                 input_ch_views=3, input_ch_views_cam=3,
+                 use_uncertainties=False,
+                 world_grid_embed=None, world_grid_embed_FG=None, camera_grid_embed=None, time_grid_embed=None,
+                 big=False,
+                 coarse=True):
+        super(NeuralDiff_BGFGSeparate, self).__init__()
+
+        self.input_ch, self.input_cam_ch = input_ch, input_cam_ch # it's raw xyzt, so input_ch=4
+        self.input_ch_views, self.input_ch_views_cam = input_ch_views, input_ch_views_cam # has embedded views
+
+        self.num_layers, self.num_layers_color, self.hidden_dim = num_layers, num_layers_color, hidden_dim
+        self.geo_feat_dim = geo_feat_dim
+        self.num_layers_FG, self.num_layers_ACTOR = num_layers_FG, num_layers_ACTOR
+        if coarse:
+            self.use_uncertainties = False
+        else:
+            self.use_uncertainties = use_uncertainties
+        self.big = big
+        self.coarse = coarse # Is this a coarse model?
+        
+        self.world_grid_embed = world_grid_embed
+        if not coarse: # if this is a "fine" model, use dynamic components
+            self.camera_grid_embed, self.time_grid_embed = camera_grid_embed, time_grid_embed
+            self.world_grid_embed_FG = world_grid_embed_FG # separate high freq grid for FG
+
+        ### Background Network
+        # sigma network
+        BG_sigma_net = []
+        for l in range(num_layers):
+            in_dim = world_grid_embed.out_dim if l == 0 else (hidden_dim + 64)*(self.big+1)
+            out_dim = 1 + geo_feat_dim if l==num_layers-1 else (hidden_dim + 64)*(self.big+1)   # 1 sigma + 15 SH features for color
+            BG_sigma_net.append(nn.Linear(in_dim, out_dim, bias=False))
+            if l!=num_layers-1:
+                BG_sigma_net.append(nn.ReLU())
+
+        # color network
+        BG_color_net =  []
+        for l in range(num_layers_color):
+            in_dim = input_ch_views + geo_feat_dim if l == 0 else hidden_dim*(self.big+1)
+            out_dim = 3 if l==num_layers_color-1 else hidden_dim*(self.big+1)  # 3 rgb
+            BG_color_net.append(nn.Linear(in_dim, out_dim, bias=False))
+            if l!=num_layers_color-1:
+                BG_color_net.append(nn.ReLU())
+
+        self.BG_sigma_net, self.BG_color_net = nn.Sequential(*BG_sigma_net), nn.Sequential(*BG_color_net)
+
+        if not coarse: # if this is a "fine" model, use dynamic components
+            ### Foreground Network
+            FG_net = []
+            for l in range(num_layers_FG):
+                in_dim = world_grid_embed_FG.out_dim + time_grid_embed.out_dim if l == 0 else hidden_dim*(self.big+1)
+                out_dim = 3 + 1 + 1 if l==num_layers_FG-1 else hidden_dim*(self.big+1)  # 3 rgb_FG + 1 sigma_FG + 1 uncertainty_FG
+                FG_net.append(nn.Linear(in_dim, out_dim, bias=False))
+                if l!=num_layers_FG-1:
+                    FG_net.append(nn.ReLU())
+            self.FG_net = nn.Sequential(*FG_net)
+
+            ### Actor Network
+            ACTOR_net = []
+            for l in range(num_layers_ACTOR):
+                in_dim = camera_grid_embed.out_dim + time_grid_embed.out_dim if l == 0 else hidden_dim*2
+                out_dim = 3 + 1 + 1 if l==num_layers_ACTOR-1 else hidden_dim*2  # 3 rgb_ACTOR + 1 sigma_ACTOR + 1 uncertainty_ACTOR
+                ACTOR_net.append(nn.Linear(in_dim, out_dim, bias=False))
+                if l!=num_layers_ACTOR-1:
+                    ACTOR_net.append(nn.ReLU())
+            self.ACTOR_net = nn.Sequential(*ACTOR_net)
+    
+    def forward(self, x):
+        input_pts, input_pts_cam, input_views, _ = torch.split(x, [self.input_ch, self.input_cam_ch, self.input_ch_views, self.input_ch_views_cam], dim=-1)
+        embedded_xyz, keep_mask = self.world_grid_embed(input_pts[...,:3])
+        if not self.coarse:
+            embedded_xyz_FG, keep_mask_FG = self.world_grid_embed_FG(input_pts[...,:3])
+            embedded_time = self.time_grid_embed(input_pts[...,3].unsqueeze(-1))
+            embedded_xyz_cam, keep_mask_cam = self.camera_grid_embed(input_pts_cam[...,:3])
+
+        ### Static components
+        h = self.BG_sigma_net(embedded_xyz)
+        BG_sigma, ray_encoding = h[..., 0], h[..., 1:]
+        BG_color = self.BG_color_net(torch.cat([input_views, ray_encoding], dim=-1))
+        BG_color = F.sigmoid(BG_color)
+        BG_sigma = relu_act(BG_sigma)
+        BG_sigma, BG_color = BG_sigma*keep_mask, BG_color*keep_mask[:,None]
+
+        ### Dynamic components
+        if not self.coarse:
+            h = self.FG_net(torch.cat([embedded_xyz_FG, embedded_time], dim=-1))
+            FG_color, FG_sigma, FG_uncertainties = h[..., :3], h[..., 3], h[..., 4]
+            FG_color = F.sigmoid(FG_color)
+
+            h = self.ACTOR_net(torch.cat([embedded_xyz_cam, embedded_time], dim=-1))
+            ACTOR_color, ACTOR_sigma, ACTOR_uncertainties = h[..., :3], h[..., 3], h[..., 4]
+            ACTOR_color = F.sigmoid(ACTOR_color)
+
+            FG_sigma, FG_uncertainties = relu_act(FG_sigma), relu_act(FG_uncertainties)
+            ACTOR_sigma, ACTOR_uncertainties = relu_act(ACTOR_sigma), relu_act(ACTOR_uncertainties)
+            FG_sigma, FG_color = FG_sigma*keep_mask_FG, FG_color*keep_mask_FG[:,None]
+            ACTOR_sigma, ACTOR_color = ACTOR_sigma*keep_mask_cam, ACTOR_color*keep_mask_cam[:,None]
+        else:
+            FG_sigma, FG_color, FG_uncertainties = torch.zeros_like(BG_sigma), torch.zeros_like(BG_color), None
+            ACTOR_sigma, ACTOR_color, ACTOR_uncertainties = torch.zeros_like(BG_sigma), torch.zeros_like(BG_color), None
+
+        # Principled color mixing
+        sigma = BG_sigma + FG_sigma + ACTOR_sigma + 1e-9
+        color = (BG_sigma/sigma)[:,None] * BG_color + (FG_sigma/sigma)[:,None] * FG_color + (ACTOR_sigma/sigma)[:,None] * ACTOR_color
+
+        if self.use_uncertainties:
+            return torch.cat([BG_color, FG_color, ACTOR_color, # :3, 3:6, 6:9
+                                BG_sigma.unsqueeze(dim=-1), FG_sigma.unsqueeze(dim=-1), ACTOR_sigma.unsqueeze(dim=-1), # 9, 10, 11
+                                FG_uncertainties.unsqueeze(dim=-1), ACTOR_uncertainties.unsqueeze(dim=-1)], -1) # 12, 13
+        else:
+            return torch.cat([color, sigma.unsqueeze(dim=-1)], -1)
+
 
 
 # Ray helpers

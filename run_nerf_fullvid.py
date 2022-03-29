@@ -205,7 +205,7 @@ def render_video(render_poses, fixed_pose_idx, render_frame_idxs, hwf, K, chunk,
         psnrs.append(p)
 
         ### Create figure
-        f, p = plt.subplots(3, 5, figsize=(20,6))
+        f, p = plt.subplots(2, 5, figsize=(20,4))
         p[0,0].imshow(to8b(gt_img))
         p[0,0].set_ylabel("Ego Viewpoint", fontdict={"fontsize":15}, rotation='horizontal', ha='right')
         p[0,0].set_xlabel("Ground Truth", fontdict={"fontsize":15})
@@ -246,25 +246,13 @@ def render_video(render_poses, fixed_pose_idx, render_frame_idxs, hwf, K, chunk,
         p[1,4].set_xlabel("Actor", fontdict={"fontsize":15})
         p[1,4].xaxis.set_label_position('top')
         
-        p[2,0].axis("off")
-        p[2,1].axis("off")
-        p[2,2].axis("off")
-                
-        p[2,3].imshow(to8b(extras["FG_acc_map"].cpu().numpy()))
-        p[2,3].set_xlabel("Transient", fontdict={"fontsize":15})
-        p[2,3].xaxis.set_label_position('top')
-        
-        p[2,4].imshow(to8b(extras["ACTOR_acc_map"].cpu().numpy()))
-        p[2,4].set_xlabel("Actor", fontdict={"fontsize":15})
-        p[2,4].xaxis.set_label_position('top')
-
         for r in range(2):
             for c in range(5):
                 p[r,c].set_xticklabels([])
                 p[r,c].set_yticklabels([])
                 p[r,c].set_xticks([])
                 p[r,c].set_yticks([])
-        f.savefig(os.path.join(savedir, '{:03d}_combined_withmasks.png'.format(int(render_frame_idxs[i]))), bbox_inches='tight')
+        f.savefig(os.path.join(savedir, '{:03d}_combined.png'.format(int(render_frame_idxs[i]))), bbox_inches='tight')
 
         numpy_fig = mplfig_to_npimage(f)
         numpy_figs.append(numpy_fig)
@@ -390,13 +378,6 @@ def create_nerf(args):
                         log2_hashmap_size=args.log2_hashmap_size, \
                         finest_resolution=args.finest_res)
     world_grid_embed_FG = None
-    if args.bg_fg_separate:
-        # high freq embedding for FG
-        world_grid_embed_FG = HashEmbedder(bounding_box=xyz_bounding_box, \
-                                n_features_per_level=4 if args.big_world_embed else 2, \
-                                base_resolution=128,
-                                log2_hashmap_size=args.log2_hashmap_size, \
-                                finest_resolution=args.finest_res*4)
     camera_grid_embed = HashEmbedder(bounding_box=xyz_bounding_box_cam, \
                         n_levels=4 if args.actor_small_embed else 16,
                         base_resolution=128 if args.actor_high_freq else 16,
@@ -407,13 +388,27 @@ def create_nerf(args):
     else:
         time_grid_embed = Linear_HashEmbedder(t_bounding_range)
 
+    ### DERIVING EMBEDDERS
+    FG_embedder = XYZplusT_HashEmbedder(bounding_box=args.bounding_box, \
+                                        xyz_embedder=world_grid_embed_FG,
+                                        t_embedder=time_grid_embed)
+    ACTOR_embedder = XYZplusT_HashEmbedder(bounding_box=args.bounding_box_incameraframe, \
+                                        xyz_embedder=camera_grid_embed,
+                                        t_embedder=time_grid_embed)
+
+    # BG_embedder = HashEmbedder(bounding_box=xyz_bounding_box, \
+    #                     log2_hashmap_size=args.log2_hashmap_size, \
+    #                     finest_resolution=args.finest_res)
+    # FG_embedder = XYZplusT_HashEmbedder(bounding_box=args.bounding_box, \
+    #                     log2_hashmap_size=args.log2_hashmap_size, \
+    #                     finest_resolution=args.finest_res)
+    # ACTOR_embedder = XYZplusT_HashEmbedder(bounding_box=args.bounding_box_incameraframe, \
+    #                     log2_hashmap_size=args.log2_hashmap_size, \
+    #                     finest_resolution=args.finest_res)
+
     if args.i_embed==1:
         # model_class = BackgroundForegroundActorNeRF_separateEmbeddings
-        if args.bg_fg_separate:
-            model_class = NeuralDiff_BGFGSeparate
-        else:
-            model_class = NeuralDiff
-    
+        model_class = NeuralDiff
         model = model_class(num_layers=2,
                         hidden_dim=64,
                         geo_feat_dim=15,
@@ -421,9 +416,10 @@ def create_nerf(args):
                         input_ch=input_ch, input_cam_ch=input_ch,
                         input_ch_views=input_ch_views, input_ch_views_cam=input_ch_views,
                         use_uncertainties=args.use_uncertainties,
-                        world_grid_embed=world_grid_embed, world_grid_embed_FG=world_grid_embed_FG, camera_grid_embed=camera_grid_embed, time_grid_embed=time_grid_embed,
+                        world_grid_embed=world_grid_embed, camera_grid_embed=camera_grid_embed, time_grid_embed=time_grid_embed,
                         big=args.big,
-                        coarse=True).to(device)
+                        coarse=True,
+                        small_actor_MLP=args.small_actor_MLP).to(device)
     else:
         model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
@@ -441,10 +437,7 @@ def create_nerf(args):
     if args.N_importance > 0:
         if args.i_embed==1:
             # model_class = BackgroundForegroundActorNeRF_separateEmbeddings
-            if args.bg_fg_separate:
-                model_class = NeuralDiff_BGFGSeparate
-            else:
-                model_class = NeuralDiff
+            model_class = NeuralDiff
             model_fine = model_class(num_layers=2,
                             hidden_dim=64,
                             geo_feat_dim=15,
@@ -452,9 +445,10 @@ def create_nerf(args):
                             input_ch=input_ch, input_cam_ch=input_ch,
                             input_ch_views=input_ch_views, input_ch_views_cam=input_ch_views,
                             use_uncertainties=args.use_uncertainties,
-                            world_grid_embed=world_grid_embed, world_grid_embed_FG=world_grid_embed_FG, camera_grid_embed=camera_grid_embed, time_grid_embed=time_grid_embed,
+                            world_grid_embed=world_grid_embed, camera_grid_embed=camera_grid_embed, time_grid_embed=time_grid_embed,
                             big=args.big,
-                            coarse=False).to(device)
+                            coarse=False,
+                            small_actor_MLP=args.small_actor_MLP).to(device)
         else:
             model_fine = NeRF(D=args.netdepth_fine, W=args.netwidth_fine,
                           input_ch=input_ch, output_ch=output_ch, skips=skips,
@@ -512,7 +506,8 @@ def create_nerf(args):
         ckpt = torch.load(ckpt_path)
 
         start = ckpt['global_step']
-        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        if not args.only_foreground:
+            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
 
         # Load model
         model.load_state_dict(ckpt['network_fn_state_dict'])
@@ -600,7 +595,6 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
         rgb = raw[...,:3]  # [N_rays, N_samples, 3]
         sigma = raw[...,3]
         BG_rgb_map, FG_rgb_map, ACTOR_rgb_map = None, None, None
-        BG_acc_map, FG_acc_map, ACTOR_acc_map = None, None, None
     else:
         BG_rgb = raw[...,:3]
         FG_rgb = raw[...,3:6]
@@ -659,9 +653,6 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
         FG_rgb_map = torch.sum(FG_weights[...,None] * FG_rgb, -2)
         ACTOR_rgb_map = torch.sum(ACTOR_weights[...,None] * ACTOR_rgb, -2)
 
-        FG_acc_map = torch.sum(FG_weights, -1)
-        ACTOR_acc_map = torch.sum(ACTOR_weights, -1)
-
     sigma_L1 = torch.zeros(raw.shape[0])
     if raw.shape[-1] > 4 and not test_time:
         if not sigma_cauchy:
@@ -683,7 +674,7 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     # entropy = Categorical(probs = weights+1e-5).entropy()
     # sparsity_loss = entropy * mask
 
-    return rgb_map, disp_map, acc_map, weights, depth_map, sigma_L1, uncertainty_map, BG_rgb_map, FG_rgb_map, ACTOR_rgb_map, FG_acc_map, ACTOR_acc_map
+    return rgb_map, disp_map, acc_map, weights, depth_map, sigma_L1, uncertainty_map, BG_rgb_map, FG_rgb_map, ACTOR_rgb_map
 
 
 def render_rays(ray_batch,
@@ -772,12 +763,11 @@ def render_rays(ray_batch,
 
 #     raw = run_network(pts)
     raw = network_query_fn(pts, pts_cam, viewdirs, viewdirs_cam, network_fn)
-    rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss, uncertainty_map, BG_rgb_map, FG_rgb_map, ACTOR_rgb_map, FG_acc_map, ACTOR_acc_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest, test_time=test_time, coarse=network_fn.coarse, sigma_cauchy=sigma_cauchy)
+    rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss, uncertainty_map, BG_rgb_map, FG_rgb_map, ACTOR_rgb_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest, test_time=test_time, coarse=network_fn.coarse, sigma_cauchy=sigma_cauchy)
 
     if N_importance > 0:
 
         rgb_map_0, disp_map_0, acc_map_0, sparsity_loss_0, uncertainty_map_0, BG_rgb_map_0, FG_rgb_map_0, ACTOR_rgb_map_0 = rgb_map, disp_map, acc_map, sparsity_loss, uncertainty_map, BG_rgb_map, FG_rgb_map, ACTOR_rgb_map
-        FG_acc_map_0, ACTOR_acc_map_0 = FG_acc_map, ACTOR_acc_map
 
         z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
         z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.), pytest=pytest)
@@ -793,15 +783,12 @@ def render_rays(ray_batch,
 #         raw = run_network(pts, fn=run_fn)
         raw = network_query_fn(pts, pts_cam, viewdirs, viewdirs_cam, run_fn)
 
-        rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss, uncertainty_map, BG_rgb_map, FG_rgb_map, ACTOR_rgb_map, FG_acc_map, ACTOR_acc_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest, test_time=test_time, coarse=run_fn.coarse, sigma_cauchy=sigma_cauchy)
+        rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss, uncertainty_map, BG_rgb_map, FG_rgb_map, ACTOR_rgb_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest, test_time=test_time, coarse=run_fn.coarse, sigma_cauchy=sigma_cauchy)
 
     ret = {'rgb_map' : rgb_map, 'disp_map' : disp_map, 'acc_map' : acc_map, 'sparsity_loss': sparsity_loss}
     ret["BG_rgb_map"] = BG_rgb_map
     ret["FG_rgb_map"] = FG_rgb_map
     ret["ACTOR_rgb_map"] = ACTOR_rgb_map
-    ret["FG_acc_map"] = FG_acc_map
-    ret["ACTOR_acc_map"] = ACTOR_acc_map
-
     if uncertainty_map is not None:
         ret['uncertainty_map'] = uncertainty_map
     if retraw:
@@ -966,8 +953,6 @@ def config_parser():
                         help='fixed version of adaptive loss')
     parser.add_argument("--sigma-cauchy", action='store_true', 
                         help='Use cauchy loss for sigma values')
-    parser.add_argument("--bg-fg-separate", action='store_true', 
-                        help='separate embedding grids for BG/FG')
     return parser
 
 
@@ -1043,10 +1028,7 @@ def train():
         else:
             args.expname += "_sparse" + str(args.sparse_loss_weight)# + "_entropy1.0"
     args.expname += "_TV" + str(args.tv_loss_weight)
-    if args.bg_fg_separate:
-        args.expname += "_BGFGDiff"
-    else:
-        args.expname += "_BGFGsame"
+    args.expname += "_BGFGsame"
     args.expname += "_BGsignoise"
     if args.actor_small_embed:
         args.expname += "_ActSmallEmb"
@@ -1112,7 +1094,7 @@ def train():
             # fixed_pose = render_poses[fixed_pose_idx]
             # fixed_poses = fixed_pose.repeat(all_frame_idxs.shape[0], 1, 1) # repeat for number of frames
             
-            videobase = os.path.join(basedir, expname, 'fixedviewpoint_comb_withmasks_{:04d}_{:06d}'.format(fixed_pose_idx, start))
+            videobase = os.path.join(basedir, expname, 'fixedviewpoint_comb_mod_{:04d}_{:06d}'.format(fixed_pose_idx, start))
             os.makedirs(videobase, exist_ok=True)
             
             sorted_idx = np.argsort(all_frame_idxs)
