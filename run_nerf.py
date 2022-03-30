@@ -397,11 +397,19 @@ def create_nerf(args):
                                 base_resolution=128,
                                 log2_hashmap_size=args.log2_hashmap_size, \
                                 finest_resolution=args.finest_res*4)
-    camera_grid_embed = HashEmbedder(bounding_box=xyz_bounding_box_cam, \
-                        n_levels=4 if args.actor_small_embed else 16,
-                        base_resolution=128 if args.actor_high_freq else 16,
-                        log2_hashmap_size=args.log2_hashmap_size, \
-                        finest_resolution=args.finest_res)
+    elif args.xyzt_model:
+        world_grid_embed_FG = HashEmbedder(bounding_box=args.bounding_box, \
+                                n_features_per_level=4 if args.big_world_embed else 2, \
+                                base_resolution=128,
+                                log2_hashmap_size=args.log2_hashmap_size, \
+                                finest_resolution=args.finest_res*4)
+
+    if not args.xyzt_model:
+        camera_grid_embed = HashEmbedder(bounding_box=xyz_bounding_box_cam, \
+                            n_levels=4 if args.actor_small_embed else 16,
+                            base_resolution=128 if args.actor_high_freq else 16,
+                            log2_hashmap_size=args.log2_hashmap_size, \
+                            finest_resolution=args.finest_res)
     if args.big_time:
         time_grid_embed = Linear_HashEmbedder(t_bounding_range, n_levels=6, n_features_per_level=3)
     else:
@@ -411,6 +419,8 @@ def create_nerf(args):
         # model_class = BackgroundForegroundActorNeRF_separateEmbeddings
         if args.bg_fg_separate:
             model_class = NeuralDiff_BGFGSeparate
+        elif args.xyzt_model:
+            model_class = BGFG_XYZT
         else:
             model_class = NeuralDiff
     
@@ -968,6 +978,10 @@ def config_parser():
                         help='Use cauchy loss for sigma values')
     parser.add_argument("--bg-fg-separate", action='store_true', 
                         help='separate embedding grids for BG/FG')
+    parser.add_argument("--entropy-weight", type=float, default=1e-6,
+                        help='weight for Entropy loss on sigmas')
+    parser.add_argument("--xyzt-model", action='store_true', 
+                        help='use XYZT model')
     return parser
 
 
@@ -1039,9 +1053,11 @@ def train():
         args.expname += "_STATIC"
     if args.sparse_loss_weight > 0:
         if args.sigma_cauchy:
-            args.expname += "_cauchy" + str(args.sparse_loss_weight)# + "_entropy1.0"
+            args.expname += "_cauchy" + str(args.sparse_loss_weight)
         else:
-            args.expname += "_sparse" + str(args.sparse_loss_weight)# + "_entropy1.0"
+            args.expname += "_sparse" + str(args.sparse_loss_weight)
+    if args.entropy_weight > 0:
+        args.expname += "_ent" + str(args.entropy_weight)
     args.expname += "_TV" + str(args.tv_loss_weight)
     if args.bg_fg_separate:
         args.expname += "_BGFGDiff"
@@ -1249,6 +1265,14 @@ def train():
 
         sparsity_loss = args.sparse_loss_weight*(extras["sparsity_loss"].mean() + extras["sparsity_loss0"].mean())
         loss = loss + sparsity_loss
+
+        ### Add entropy loss
+        if args.entropy_weight>0:
+            BG_sigma, FG_sigma, ACTOR_sigma = extras["raw"][...,9], extras["raw"][...,10], extras["raw"][...,11]
+            sigma = BG_sigma + FG_sigma + ACTOR_sigma + 1e-9
+            entropy = Categorical(probs = torch.stack([BG_sigma/sigma, FG_sigma/sigma, ACTOR_sigma/sigma], dim=-1) + 1e-8).entropy()
+            entropy_loss = entropy.sum(dim=-1)
+            loss = loss + args.entropy_weight*entropy_loss.mean()
        
         # add Total Variation loss
         if args.i_embed==1:

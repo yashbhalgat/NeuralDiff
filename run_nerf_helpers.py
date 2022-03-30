@@ -684,6 +684,91 @@ class NeuralDiff_BGFGSeparate(nn.Module):
             return torch.cat([color, sigma.unsqueeze(dim=-1)], -1)
 
 
+class BGFG_XYZT(nn.Module):
+    '''
+    XYZT grid for foreground model 
+    '''
+    def __init__(self,
+                 num_layers=3,
+                 hidden_dim=64,
+                 geo_feat_dim=15,
+                 num_layers_color=4,
+                 num_layers_FG=4,
+                 input_ch=4, input_cam_ch=4,
+                 input_ch_views=3, input_ch_views_cam=3,
+                 use_uncertainties=False,
+                 static_grid=None, xyzt_grid=None,
+                 coarse=True):
+        super(BGFG_XYZT, self).__init__()
+
+        self.input_ch, self.input_cam_ch = input_ch, input_cam_ch # it's raw xyzt, so input_ch=4
+        self.input_ch_views, self.input_ch_views_cam = input_ch_views, input_ch_views_cam # has embedded views
+
+        self.num_layers, self.num_layers_color, self.hidden_dim = num_layers, num_layers_color, hidden_dim
+        self.geo_feat_dim = geo_feat_dim
+        self.num_layers_FG = num_layers_FG
+        if coarse:
+            self.use_uncertainties = False
+        else:
+            self.use_uncertainties = use_uncertainties
+        self.coarse = coarse # Is this a coarse model?
+        
+        self.static_grid = static_grid
+        if not coarse: # if this is a "fine" model, use dynamic components
+            self.xyzt_grid = xyzt_grid # separate high freq grid for FG
+
+        ### Background Network
+        self.BG_sigma_net, self.BG_color_net = create_sigma_and_color_MLP(num_layers, num_layers_color,
+                                                                    hidden_dim, 53, # 53 is random! bad code, sorry :(
+                                                                    self.static_grid.out_dim, # only XYZ
+                                                                    input_ch_views, geo_feat_dim)
+
+        if not coarse: # if this is a "fine" model, use dynamic components
+            ### Foreground Network
+            self.FG_sigma_net, self.FG_color_net = create_sigma_and_color_MLP(num_layers, num_layers_color,
+                                                                    hidden_dim, 53, # 53 is random! bad code, sorry :(
+                                                                    self.xyzt_grid.out_dim, # only XYZ
+                                                                    input_ch_views, geo_feat_dim)
+
+    def forward(self, x):
+        input_pts, input_pts_cam, input_views, _ = torch.split(x, [self.input_ch, self.input_cam_ch, self.input_ch_views, self.input_ch_views_cam], dim=-1)
+        embedded_xyz, keep_mask = self.static_grid(input_pts[...,:3])
+        if not self.coarse:
+            embedded_xyzt, keep_mask_FG = self.xyzt_grid(input_pts)
+
+        ### Static components
+        BG_sigma, BG_color, _ = forward_through_MLP(self.BG_sigma_net, self.BG_color_net, \
+                                                    embedded_xyz, input_views, \
+                                                    self.num_layers, self.num_layers_color)
+        BG_color = F.sigmoid(BG_color)
+        BG_sigma, BG_color = BG_sigma*keep_mask, BG_color*keep_mask[:,None]
+
+        ### Dynamic components
+        if not self.coarse:
+            FG_sigma, FG_color, FG_uncertainties = forward_through_MLP(self.FG_sigma_net, self.FG_color_net, \
+                                                                       embedded_xyzt, input_views, \
+                                                                       self.num_layers, self.num_layers_color)
+            FG_color = F.sigmoid(FG_color)
+            FG_sigma, FG_color = FG_sigma*keep_mask_FG, FG_color*keep_mask_FG[:,None]
+        else:
+            FG_sigma, FG_color, FG_uncertainties = torch.zeros_like(BG_sigma), torch.zeros_like(BG_color), None
+
+        ### we don't have actor, but doing this to make the code consistent
+        ACTOR_sigma, ACTOR_color = torch.zeros_like(BG_sigma), torch.zeros_like(BG_color) 
+        ACTOR_uncertainties = torch.zeros_like(FG_uncertainties) if not self.coarse else None
+        ##################
+
+        # Principled color mixing
+        sigma = BG_sigma + FG_sigma + ACTOR_sigma + 1e-9
+        color = (BG_sigma/sigma)[:,None] * BG_color + (FG_sigma/sigma)[:,None] * FG_color + (ACTOR_sigma/sigma)[:,None] * ACTOR_color
+
+        if self.use_uncertainties:
+            return torch.cat([BG_color, FG_color, ACTOR_color, # :3, 3:6, 6:9
+                                BG_sigma.unsqueeze(dim=-1), FG_sigma.unsqueeze(dim=-1), ACTOR_sigma.unsqueeze(dim=-1), # 9, 10, 11
+                                FG_uncertainties.unsqueeze(dim=-1), ACTOR_uncertainties.unsqueeze(dim=-1)], -1) # 12, 13
+        else:
+            return torch.cat([color, sigma.unsqueeze(dim=-1)], -1)
+
 
 # Ray helpers
 def get_rays_incameraframe(H, W, K):

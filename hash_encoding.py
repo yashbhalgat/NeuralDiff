@@ -22,13 +22,12 @@ class HashEmbedder(nn.Module):
         self.b = torch.exp((torch.log(self.finest_resolution.float())-torch.log(self.base_resolution.float()))/(n_levels-1))
 
         self.embeddings = nn.ModuleList([nn.Embedding(2**self.log2_hashmap_size, \
-                                        self.n_features_per_level) for i in range(n_levels)])
+                                        self.n_features_per_level) for _ in range(n_levels)])
         # custom uniform initialization
         for i in range(n_levels):
             nn.init.uniform_(self.embeddings[i].weight, a=-0.0001, b=0.0001)
             # self.embeddings[i].weight.data.zero_()
         
-
     def trilinear_interp(self, x, voxel_min_vertex, voxel_max_vertex, voxel_embedds):
         '''
         x: B x 3
@@ -55,18 +54,59 @@ class HashEmbedder(nn.Module):
 
         return c
 
+    def quadrilinear_interp(self, x, voxel_min_vertex, voxel_max_vertex, voxel_embedds):
+        '''
+        x: B x 4
+        voxel_min_vertex: B x 4
+        voxel_max_vertex: B x 4
+        voxel_embedds: B x 16 x 2
+        '''
+        # extension of: https://en.wikipedia.org/wiki/Trilinear_interpolation
+        weights = (x - voxel_min_vertex)/(voxel_max_vertex-voxel_min_vertex) # B x 4
+
+        # step 1
+        # 0->0000, 1->0001, 2->0010, 3->0011, 4->0100, 5->0101, 6->0110, 7->0111
+        # 8->1000, 9->1001, 10->1010, 11->1011, 12->1100, 13->1101, 14->1110, 15->1111
+        c000 = voxel_embedds[:,0]*(1-weights[:,0][:,None]) + voxel_embedds[:,8]*weights[:,0][:,None]
+        c001 = voxel_embedds[:,1]*(1-weights[:,0][:,None]) + voxel_embedds[:,9]*weights[:,0][:,None]
+        c010 = voxel_embedds[:,2]*(1-weights[:,0][:,None]) + voxel_embedds[:,10]*weights[:,0][:,None]
+        c011 = voxel_embedds[:,3]*(1-weights[:,0][:,None]) + voxel_embedds[:,11]*weights[:,0][:,None]
+        c100 = voxel_embedds[:,4]*(1-weights[:,0][:,None]) + voxel_embedds[:,12]*weights[:,0][:,None]
+        c101 = voxel_embedds[:,5]*(1-weights[:,0][:,None]) + voxel_embedds[:,13]*weights[:,0][:,None]
+        c110 = voxel_embedds[:,6]*(1-weights[:,0][:,None]) + voxel_embedds[:,14]*weights[:,0][:,None]
+        c111 = voxel_embedds[:,7]*(1-weights[:,0][:,None]) + voxel_embedds[:,15]*weights[:,0][:,None]
+
+        # step 2
+        c00 = c000*(1-weights[:,1][:,None]) + c100*weights[:,1][:,None]
+        c01 = c001*(1-weights[:,1][:,None]) + c101*weights[:,1][:,None]
+        c10 = c010*(1-weights[:,1][:,None]) + c110*weights[:,1][:,None]
+        c11 = c011*(1-weights[:,1][:,None]) + c111*weights[:,1][:,None]
+
+        # step 3
+        c0 = c00*(1-weights[:,2][:,None]) + c10*weights[:,2][:,None]
+        c1 = c01*(1-weights[:,2][:,None]) + c11*weights[:,2][:,None]
+
+        # step 3
+        c = c0*(1-weights[:,3][:,None]) + c1*weights[:,3][:,None]
+
+        return c
+
     def forward(self, x):
-        # x is 3D point position: B x 3
+        # x is 3D (xyz) or 4D (xyzt) point position: B x 3 or B x 4
         x_embedded_all = []
         for i in range(self.n_levels):
             resolution = torch.floor(self.base_resolution * self.b**i)
+            pdb.set_trace()
             voxel_min_vertex, voxel_max_vertex, hashed_voxel_indices, keep_mask = get_voxel_vertices(\
                                                 x, self.bounding_box, \
                                                 resolution, self.log2_hashmap_size)
             
             voxel_embedds = self.embeddings[i](hashed_voxel_indices)
 
-            x_embedded = self.trilinear_interp(x, voxel_min_vertex, voxel_max_vertex, voxel_embedds)
+            if x.shape[-1]==3:
+                x_embedded = self.trilinear_interp(x, voxel_min_vertex, voxel_max_vertex, voxel_embedds)
+            elif x.shape[-1]==4:
+                x_embedded = self.quadrilinear_interp(x, voxel_min_vertex, voxel_max_vertex, voxel_embedds)
             x_embedded_all.append(x_embedded)
 
         keep_mask = keep_mask.sum(dim=-1)==keep_mask.shape[-1]
