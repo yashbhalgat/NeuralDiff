@@ -89,7 +89,8 @@ def create_sigma_and_color_MLP(
     hidden_dim, hidden_dim_color,
     input_ch,
     input_ch_views,
-    geo_feat_dim
+    geo_feat_dim,
+    use_viewdirs=True
 ):
     # sigma network
     sigma_net = []
@@ -110,7 +111,10 @@ def create_sigma_and_color_MLP(
     color_net =  []
     for l in range(num_layers_color):
         if l == 0:
-            in_dim = input_ch_views + geo_feat_dim
+            if use_viewdirs:
+                in_dim = input_ch_views + geo_feat_dim
+            else:
+                in_dim = geo_feat_dim
         else:
             in_dim = hidden_dim
         
@@ -139,7 +143,11 @@ def forward_through_MLP(sigma_net, color_net, embedded_x, embedded_views, \
         sigma = relu_act(sigma)
 
         # color
-        h = torch.cat([embedded_views, geo_feat], dim=-1)
+        if embedded_views is not None:
+            h = torch.cat([embedded_views, geo_feat], dim=-1)
+        else:
+            h = geo_feat
+
         for l in range(num_layers_color):
             h = color_net[l](h)
             if l != num_layers_color - 1:
@@ -698,7 +706,8 @@ class BGFG_XYZT(nn.Module):
                  input_ch_views=3, input_ch_views_cam=3,
                  use_uncertainties=False,
                  static_grid=None, xyzt_grid=None,
-                 coarse=True):
+                 coarse=True,
+                 use_viewdirs_FG=False):
         super(BGFG_XYZT, self).__init__()
 
         self.input_ch, self.input_cam_ch = input_ch, input_cam_ch # it's raw xyzt, so input_ch=4
@@ -712,7 +721,8 @@ class BGFG_XYZT(nn.Module):
         else:
             self.use_uncertainties = use_uncertainties
         self.coarse = coarse # Is this a coarse model?
-        
+        self.use_viewdirs_FG = use_viewdirs_FG
+
         self.static_grid = static_grid
         if not coarse: # if this is a "fine" model, use dynamic components
             self.xyzt_grid = xyzt_grid # separate high freq grid for FG
@@ -728,14 +738,15 @@ class BGFG_XYZT(nn.Module):
             self.FG_sigma_net, self.FG_color_net = create_sigma_and_color_MLP(num_layers, num_layers_color,
                                                                     hidden_dim, 53, # 53 is random! bad code, sorry :(
                                                                     self.xyzt_grid.out_dim, # only XYZ
-                                                                    input_ch_views, geo_feat_dim)
+                                                                    input_ch_views, geo_feat_dim,
+                                                                    use_viewdirs=use_viewdirs_FG)
 
     def forward(self, x):
         input_pts, input_pts_cam, input_views, _ = torch.split(x, [self.input_ch, self.input_cam_ch, self.input_ch_views, self.input_ch_views_cam], dim=-1)
         embedded_xyz, keep_mask = self.static_grid(input_pts[...,:3])
         if not self.coarse:
             embedded_xyzt, keep_mask_FG = self.xyzt_grid(input_pts)
-
+        
         ### Static components
         BG_sigma, BG_color, _ = forward_through_MLP(self.BG_sigma_net, self.BG_color_net, \
                                                     embedded_xyz, input_views, \
@@ -745,9 +756,14 @@ class BGFG_XYZT(nn.Module):
 
         ### Dynamic components
         if not self.coarse:
-            FG_sigma, FG_color, FG_uncertainties = forward_through_MLP(self.FG_sigma_net, self.FG_color_net, \
-                                                                       embedded_xyzt, input_views, \
-                                                                       self.num_layers, self.num_layers_color)
+            if self.use_viewdirs_FG:
+                FG_sigma, FG_color, FG_uncertainties = forward_through_MLP(self.FG_sigma_net, self.FG_color_net, \
+                                                                        embedded_xyzt, input_views, \
+                                                                        self.num_layers, self.num_layers_color)
+            else:
+                FG_sigma, FG_color, FG_uncertainties = forward_through_MLP(self.FG_sigma_net, self.FG_color_net, \
+                                                                        embedded_xyzt, None, \
+                                                                        self.num_layers, self.num_layers_color)
             FG_color = F.sigmoid(FG_color)
             FG_sigma, FG_color = FG_sigma*keep_mask_FG, FG_color*keep_mask_FG[:,None]
         else:

@@ -184,8 +184,6 @@ def render_video(render_poses, fixed_pose_idx, render_frame_idxs, hwf, K, chunk,
     psnrs = []
     t = time.time()
     for i, c2w in enumerate(tqdm(render_poses)):
-        if i<30 or i%2==0:
-            continue
         print(i, time.time() - t)
         t = time.time()
 
@@ -404,26 +402,27 @@ def create_nerf(args):
                                 log2_hashmap_size=args.log2_hashmap_size, \
                                 finest_resolution=args.finest_res*4)
 
+    camera_grid_embed, time_grid_embed = None, None
     if not args.xyzt_model:
         camera_grid_embed = HashEmbedder(bounding_box=xyz_bounding_box_cam, \
                             n_levels=4 if args.actor_small_embed else 16,
                             base_resolution=128 if args.actor_high_freq else 16,
                             log2_hashmap_size=args.log2_hashmap_size, \
                             finest_resolution=args.finest_res)
-    if args.big_time:
-        time_grid_embed = Linear_HashEmbedder(t_bounding_range, n_levels=6, n_features_per_level=3)
-    else:
-        time_grid_embed = Linear_HashEmbedder(t_bounding_range)
 
-    if args.i_embed==1:
-        # model_class = BackgroundForegroundActorNeRF_separateEmbeddings
-        if args.bg_fg_separate:
-            model_class = NeuralDiff_BGFGSeparate
-        elif args.xyzt_model:
-            model_class = BGFG_XYZT
+        ### separate time embedding only when not using XYZT model
+        if args.big_time:
+            time_grid_embed = Linear_HashEmbedder(t_bounding_range, n_levels=6, n_features_per_level=3)
         else:
-            model_class = NeuralDiff
-    
+            time_grid_embed = Linear_HashEmbedder(t_bounding_range)
+
+    # model_class = BackgroundForegroundActorNeRF_separateEmbeddings
+    if args.bg_fg_separate:
+        model_class = NeuralDiff_BGFGSeparate
+    else:
+        model_class = NeuralDiff
+
+    if not args.xyzt_model:
         model = model_class(num_layers=2,
                         hidden_dim=64,
                         geo_feat_dim=15,
@@ -435,10 +434,17 @@ def create_nerf(args):
                         big=args.big,
                         coarse=True).to(device)
     else:
-        model = NeRF(D=args.netdepth, W=args.netwidth,
-                 input_ch=input_ch, output_ch=output_ch, skips=skips,
-                 input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
-
+        model = BGFG_XYZT(num_layers=2,
+                        hidden_dim=64,
+                        geo_feat_dim=15,
+                        num_layers_color=3,
+                        input_ch=input_ch, input_cam_ch=input_ch,
+                        input_ch_views=input_ch_views, input_ch_views_cam=input_ch_views,
+                        use_uncertainties=args.use_uncertainties,
+                        static_grid=world_grid_embed, xyzt_grid=world_grid_embed_FG,
+                        coarse=True,
+                        use_viewdirs_FG=not args.no_views_FG).to(device)
+    
     embedding_params = []
     grad_vars = []
     for _, child in model.named_children():
@@ -449,12 +455,13 @@ def create_nerf(args):
 
     model_fine = None
     if args.N_importance > 0:
-        if args.i_embed==1:
-            # model_class = BackgroundForegroundActorNeRF_separateEmbeddings
-            if args.bg_fg_separate:
-                model_class = NeuralDiff_BGFGSeparate
-            else:
-                model_class = NeuralDiff
+        # model_class = BackgroundForegroundActorNeRF_separateEmbeddings
+        if args.bg_fg_separate:
+            model_class = NeuralDiff_BGFGSeparate
+        else:
+            model_class = NeuralDiff
+        
+        if not args.xyzt_model:
             model_fine = model_class(num_layers=2,
                             hidden_dim=64,
                             geo_feat_dim=15,
@@ -466,17 +473,24 @@ def create_nerf(args):
                             big=args.big,
                             coarse=False).to(device)
         else:
-            model_fine = NeRF(D=args.netdepth_fine, W=args.netwidth_fine,
-                          input_ch=input_ch, output_ch=output_ch, skips=skips,
-                          input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
-
+            model_fine = BGFG_XYZT(num_layers=2,
+                            hidden_dim=64,
+                            geo_feat_dim=15,
+                            num_layers_color=3,
+                            input_ch=input_ch, input_cam_ch=input_ch,
+                            input_ch_views=input_ch_views, input_ch_views_cam=input_ch_views,
+                            use_uncertainties=args.use_uncertainties,
+                            static_grid=world_grid_embed, xyzt_grid=world_grid_embed_FG,
+                            coarse=False,
+                            use_viewdirs_FG=not args.no_views_FG).to(device)
+        
         for _, child in model_fine.named_children():
             if isinstance(child, HashEmbedder) or isinstance(child, Linear_HashEmbedder) or isinstance(child, XYZplusT_HashEmbedder):
                 embedding_params += list(child.parameters())
             else:
                 grad_vars += list(child.parameters())
             # grad_vars += list(model_fine.parameters())
-
+    
     network_query_fn = lambda inputs, inputs_cam, viewdirs, viewdirs_cam, network_fn : run_network(inputs, inputs_cam, viewdirs, viewdirs_cam, network_fn,
                                                                 embed_fn=embed_fn,
                                                                 embeddirs_fn=embeddirs_fn,
@@ -484,10 +498,10 @@ def create_nerf(args):
 
     ### Define adaptive robust loss
     if args.fixed_adaptive_loss:
+        adaptive_loss = None
+    else:
         adaptive_loss = AdaptiveLossFunction(num_dims=3, float_dtype=torch.float32, device=torch.device("cuda:0"))
         grad_vars += list(adaptive_loss.parameters())
-    else:
-        None
 
     # Create optimizer
     if args.i_embed==1:
@@ -978,10 +992,12 @@ def config_parser():
                         help='Use cauchy loss for sigma values')
     parser.add_argument("--bg-fg-separate", action='store_true', 
                         help='separate embedding grids for BG/FG')
-    parser.add_argument("--entropy-weight", type=float, default=1e-6,
+    parser.add_argument("--entropy-weight", type=float, default=0.0,
                         help='weight for Entropy loss on sigmas')
     parser.add_argument("--xyzt-model", action='store_true', 
                         help='use XYZT model')
+    parser.add_argument("--no-views-FG", action='store_true', 
+                        help='dont use views for FG in XYZT model')
     return parser
 
 
@@ -1037,7 +1053,10 @@ def train():
     #     args.expname += "_posVIEW"
     args.expname += "_fine"+str(args.finest_res) + "_log2T"+str(args.log2_hashmap_size)
     args.expname += "_lr"+str(args.lrate) + "_decay"+str(args.lrate_decay)
-    args.expname += "_NeuralDiffsig_CoarseAdapt"
+    if not args.xyzt_model:
+        args.expname += "_NeuralDiffsig_CoarseAdapt"
+    else:
+        args.expname += "_BGFG_XYZT"
     if args.fixed_adaptive_loss:
         args.expname += "Fixed"
     if args.use_uncertainties:
@@ -1070,6 +1089,8 @@ def train():
         args.expname += "_smallActMLP"
     if args.actor_high_freq:
         args.expname += "_ActHighFreq"
+    if args.no_views_FG:
+        args.expname += "_NoViewsFG"
     expname = args.expname   
 
     os.makedirs(os.path.join(basedir, expname), exist_ok=True)
@@ -1291,15 +1312,16 @@ def train():
                                                     n_levels=n_levels) for i in range(n_levels))
                 
                 ### TV loss on time
-                embed = 'time_grid_embed'
-                n_levels = render_kwargs_train['embedders'][embed].n_levels
-                min_res = render_kwargs_train['embedders'][embed].base_resolution
-                max_res = render_kwargs_train['embedders'][embed].finest_resolution
-                log2_hashmap_size = render_kwargs_train['embedders'][embed].log2_hashmap_size
-                TV_loss += sum(total_variation_loss_1D(render_kwargs_train['embedders'][embed].embeddings[i], \
-                                                min_res, max_res, \
-                                                i, log2_hashmap_size, \
-                                                n_levels=n_levels) for i in range(n_levels))
+                if render_kwargs_train['embedders']['time_grid_embed'] is not None:
+                    embed = 'time_grid_embed'
+                    n_levels = render_kwargs_train['embedders'][embed].n_levels
+                    min_res = render_kwargs_train['embedders'][embed].base_resolution
+                    max_res = render_kwargs_train['embedders'][embed].finest_resolution
+                    log2_hashmap_size = render_kwargs_train['embedders'][embed].log2_hashmap_size
+                    TV_loss += sum(total_variation_loss_1D(render_kwargs_train['embedders'][embed].embeddings[i], \
+                                                    min_res, max_res, \
+                                                    i, log2_hashmap_size, \
+                                                    n_levels=n_levels) for i in range(n_levels))
 
                 loss = loss + args.tv_loss_weight * TV_loss
                 # if i>1000:
@@ -1333,8 +1355,8 @@ def train():
                     'embed_fn_state_dict': render_kwargs_train['embed_fn'].state_dict(),
                     'world_grid_state_dict': render_kwargs_train['embedders']['world_grid_embed'].state_dict(),
                     'world_grid_FG_state_dict': render_kwargs_train['embedders']['world_grid_embed_FG'].state_dict() if render_kwargs_train['embedders']['world_grid_embed_FG'] else [],
-                    'camera_grid_state_dict': render_kwargs_train['embedders']['camera_grid_embed'].state_dict(),
-                    'time_grid_state_dict': render_kwargs_train['embedders']['time_grid_embed'].state_dict(),
+                    'camera_grid_state_dict': render_kwargs_train['embedders']['camera_grid_embed'].state_dict() if render_kwargs_train['embedders']['camera_grid_embed'] else [],
+                    'time_grid_state_dict': render_kwargs_train['embedders']['time_grid_embed'].state_dict() if render_kwargs_train['embedders']['time_grid_embed'] else [],
                     'optimizer_state_dict': optimizer.state_dict(),
                 }, path)
             else:
