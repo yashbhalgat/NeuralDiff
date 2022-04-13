@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from torch.distributions import Categorical
 from tqdm import tqdm, trange
 import pickle
+from sklearn.metrics import average_precision_score
 
 import matplotlib
 matplotlib.use('Agg')
@@ -23,10 +24,11 @@ from moviepy.video.io.bindings import mplfig_to_npimage
 
 from run_nerf_helpers import *
 from radam import RAdam
-from extra_losses import sigma_sparsity_loss, total_variation_loss_3D, total_variation_loss_1D
+from extra_losses import *
 from hash_encoding import HashEmbedder, XYZplusT_HashEmbedder, Linear_HashEmbedder
 from robust_loss_pytorch.adaptive import AdaptiveLossFunction
 from robust_loss_pytorch.general import lossfun
+from vgg import Vgg16
 
 from load_epic_kitchens import load_epic_kitchens_data
 
@@ -184,6 +186,8 @@ def render_video(render_poses, fixed_pose_idx, render_frame_idxs, hwf, K, chunk,
     psnrs = []
     t = time.time()
     for i, c2w in enumerate(tqdm(render_poses)):
+        if render_frame_idxs[i] <= 920:
+            continue
         print(i, time.time() - t)
         t = time.time()
 
@@ -268,6 +272,12 @@ def render_video(render_poses, fixed_pose_idx, render_frame_idxs, hwf, K, chunk,
         numpy_figs.append(numpy_fig)
         plt.close()
 
+        with open(os.path.join(savedir, '{:03d}_acc_embed.pkl'.format(int(render_frame_idxs[i]))), 'wb') as fp:
+            pickle.dump({
+                "acc_map": extras["FG_acc_map"].cpu().numpy(),
+                "embed_map": extras["FG_embedding_map"].cpu().numpy()
+                }, fp)
+
 
     numpy_figs = np.stack(numpy_figs, 0)
     avg_psnr = sum(psnrs)/len(psnrs)
@@ -278,7 +288,7 @@ def render_video(render_poses, fixed_pose_idx, render_frame_idxs, hwf, K, chunk,
     return numpy_figs
 
 
-def render_path(render_poses, render_frame_idxs, hwf, K, chunk, render_kwargs, gt_imgs=None, savedir=None, render_factor=0):
+def render_path(render_poses, render_frame_idxs, hwf, K, chunk, render_kwargs, gt_imgs=None, mask_gts=None, BGguided_loss=None, BGguided_sparsity=None, savedir=None, render_factor=0):
 
     H, W, focal = hwf
 
@@ -292,6 +302,7 @@ def render_path(render_poses, render_frame_idxs, hwf, K, chunk, render_kwargs, g
     disps = []
     uncertainty_maps = []
     psnrs = []
+    mAPs = []
     t = time.time()
     for i, c2w in enumerate(tqdm(render_poses)):
         print(i, time.time() - t)
@@ -327,7 +338,7 @@ def render_path(render_poses, render_frame_idxs, hwf, K, chunk, render_kwargs, g
                 imageio.imwrite(uncertainty_filename, uncertainty_map)
 
             if extras["BG_rgb_map"] is not None and gt_imgs is not None:
-                f, p = plt.subplots(2, 3, figsize=(15,8))
+                f, p = plt.subplots(3+1*(BGguided_loss is not None or BGguided_sparsity is not None), 3, figsize=(15,12))
                 p[0,0].imshow(to8b(gt_img))
                 p[0,0].title.set_text("Ground Truth")
                 p[0,0].axis("off")
@@ -344,8 +355,44 @@ def render_path(render_poses, render_frame_idxs, hwf, K, chunk, render_kwargs, g
                 p[1,2].imshow(to8b(extras["ACTOR_rgb_map"].cpu().numpy()))
                 p[1,2].axis("off")
                 p[1,2].title.set_text("Actor")
+
+                ### compute mAP over mask predictions
+                mask_pred = extras["FG_acc_map"].cpu().numpy() + extras["ACTOR_acc_map"].cpu().numpy()
+                mAP = average_precision_score(mask_gts[i].reshape(-1), mask_pred.reshape(-1))
+                print("mAP: ", mAP)
+                mAPs.append(mAP)
+                p[2,0].imshow(to8b(mask_gts[i]))
+                p[2,0].axis("off")
+                p[2,0].title.set_text("GT Mask")
+                p[2,1].imshow(to8b(mask_pred))
+                p[2,1].axis("off")
+                p[2,1].title.set_text("Pred Mask")
+                p[2,2].axis("off")
+
+                if BGguided_loss is not None:
+                    p[3,0].imshow(to8b(BGguided_loss.get_diff(torch.tensor(gt_img), extras["BG_rgb_map"]).cpu().numpy()))
+                    p[3,0].axis("off")
+                    p[3,0].title.set_text("BGguided Diff")
+                    p[3,1].imshow(to8b(BGguided_loss.get_mask(torch.tensor(gt_img), extras["BG_rgb_map"]).cpu().numpy()))
+                    p[3,1].axis("off")
+                    p[3,1].title.set_text("BGguided Mask")
+                    p[3,2].axis("off")
+
+                if BGguided_sparsity is not None:
+                    p[3,0].imshow(to8b(BGguided_sparsity.get_diff(torch.tensor(gt_img), extras["BG_rgb_map"]).cpu().numpy()))
+                    p[3,0].axis("off")
+                    p[3,0].title.set_text("BGguided Diff")
+                    p[3,1].axis("off")
+                    p[3,2].axis("off")
+
                 f.savefig(os.path.join(savedir, '{:03d}_combined.png'.format(int(render_frame_idxs[i]))), bbox_inches='tight')
                 plt.close(f)
+
+                # with open(os.path.join(savedir, '{:03d}_acc_embed.pkl'.format(int(render_frame_idxs[i]))), 'wb') as fp:
+                #     pickle.dump({
+                #         "acc_map": extras["FG_acc_map"].cpu().numpy(),
+                #         "embed_map": extras["FG_embedding_map"].cpu().numpy()
+                #         }, fp)
 
 
     rgbs = np.stack(rgbs, 0)
@@ -357,6 +404,10 @@ def render_path(render_poses, render_frame_idxs, hwf, K, chunk, render_kwargs, g
         print("Avg PSNR over Test set: ", avg_psnr)
         with open(os.path.join(savedir, "test_psnrs_avg{:0.2f}.pkl".format(avg_psnr)), "wb") as fp:
             pickle.dump(psnrs, fp)
+        
+        print("Avg mAP over Test set: ", sum(mAPs)/len(mAPs))
+        with open(os.path.join(savedir, "test_mAPs_avg{:0.2f}.pkl".format(sum(mAPs)/len(mAPs))), "wb") as fp:
+            pickle.dump(mAPs, fp)
 
     return rgbs, disps, uncertainty_maps
 
@@ -397,13 +448,22 @@ def create_nerf(args):
                                 finest_resolution=args.finest_res*4)
     elif args.xyzt_model:
         world_grid_embed_FG = HashEmbedder(bounding_box=args.bounding_box, \
+                                n_levels=args.xyzt_embed_levels, \
                                 n_features_per_level=4 if args.big_world_embed else 2, \
                                 base_resolution=128,
-                                log2_hashmap_size=args.log2_hashmap_size, \
+                                log2_hashmap_size=args.log2_hashmap_size + 3, \
                                 finest_resolution=args.finest_res*4)
 
     camera_grid_embed, time_grid_embed = None, None
-    if not args.xyzt_model:
+    if args.xyzt_model:
+        if args.use_actor_xyzt:
+            camera_grid_embed = HashEmbedder(bounding_box=args.bounding_box_incameraframe, \
+                            n_levels=args.xyzt_embed_levels, \
+                            n_features_per_level=2, \
+                            base_resolution=128,
+                            log2_hashmap_size=args.log2_hashmap_size + 3, \
+                            finest_resolution=args.finest_res*4)
+    else:
         camera_grid_embed = HashEmbedder(bounding_box=xyz_bounding_box_cam, \
                             n_levels=4 if args.actor_small_embed else 16,
                             base_resolution=128 if args.actor_high_freq else 16,
@@ -441,7 +501,7 @@ def create_nerf(args):
                         input_ch=input_ch, input_cam_ch=input_ch,
                         input_ch_views=input_ch_views, input_ch_views_cam=input_ch_views,
                         use_uncertainties=args.use_uncertainties,
-                        static_grid=world_grid_embed, xyzt_grid=world_grid_embed_FG,
+                        static_grid=world_grid_embed, xyzt_grid=world_grid_embed_FG, xyzt_grid_cam=camera_grid_embed,
                         coarse=True,
                         use_viewdirs_FG=not args.no_views_FG).to(device)
     
@@ -480,9 +540,11 @@ def create_nerf(args):
                             input_ch=input_ch, input_cam_ch=input_ch,
                             input_ch_views=input_ch_views, input_ch_views_cam=input_ch_views,
                             use_uncertainties=args.use_uncertainties,
-                            static_grid=world_grid_embed, xyzt_grid=world_grid_embed_FG,
+                            static_grid=world_grid_embed, xyzt_grid=world_grid_embed_FG, xyzt_grid_cam=camera_grid_embed,
                             coarse=False,
-                            use_viewdirs_FG=not args.no_views_FG).to(device)
+                            use_viewdirs_FG=not args.no_views_FG,
+                            use_actor=args.use_actor_xyzt,
+                            small_MLPs_dyn=args.small_MLPs_dynamic).to(device)
         
         for _, child in model_fine.named_children():
             if isinstance(child, HashEmbedder) or isinstance(child, Linear_HashEmbedder) or isinstance(child, XYZplusT_HashEmbedder):
@@ -498,10 +560,22 @@ def create_nerf(args):
 
     ### Define adaptive robust loss
     if args.fixed_adaptive_loss:
-        adaptive_loss = None
-    else:
         adaptive_loss = AdaptiveLossFunction(num_dims=3, float_dtype=torch.float32, device=torch.device("cuda:0"))
         grad_vars += list(adaptive_loss.parameters())
+    else:
+        adaptive_loss = None
+
+    if args.bg_guided_loss:
+        BGguided_loss = BGguidedLoss()
+        grad_vars += list(BGguided_loss.parameters())
+    else:
+        BGguided_loss = None
+
+    if args.bg_guided_sparsity:
+        BGguided_sparsity = BGguidedSparsityWeights()
+        grad_vars += list(BGguided_sparsity.parameters())
+    else:
+        BGguided_sparsity = None
 
     # Create optimizer
     if args.i_embed==1:
@@ -512,8 +586,8 @@ def create_nerf(args):
         grad_vars = list(set(grad_vars))
         optimizer = torch.optim.Adam([
                             {'params': grad_vars, 'weight_decay': 1e-6},
-                            {'params': embedding_params, 'eps': 1e-15}
-                        ], lr=args.lrate, betas=(0.9, 0.99))
+                            {'params': embedding_params}
+                        ], lr=args.lrate, betas=(0.9, 0.99), eps=1e-15)
     else:
         optimizer = torch.optim.Adam(params=grad_vars, lr=args.lrate, betas=(0.9, 0.999))
 
@@ -536,7 +610,7 @@ def create_nerf(args):
         ckpt = torch.load(ckpt_path)
 
         start = ckpt['global_step']
-        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        # optimizer.load_state_dict(ckpt['optimizer_state_dict'])
 
         # Load model
         model.load_state_dict(ckpt['network_fn_state_dict'])
@@ -569,7 +643,6 @@ def create_nerf(args):
                       'world_grid_embed_FG': world_grid_embed_FG, \
                       'camera_grid_embed': camera_grid_embed, \
                       'time_grid_embed': time_grid_embed},
-        'sigma_cauchy': args.sigma_cauchy
     }
 
     # NDC only good for LLFF-style forward facing data
@@ -583,7 +656,7 @@ def create_nerf(args):
     render_kwargs_test['raw_noise_std'] = 0.
     render_kwargs_test['test_time'] = True # if "test_time" in render_kwargs_test, then you are in testing mode
 
-    return render_kwargs_train, render_kwargs_test, start, adaptive_loss, optimizer
+    return render_kwargs_train, render_kwargs_test, start, adaptive_loss, BGguided_loss, BGguided_sparsity, optimizer
 
 
 def get_weights_from_sigmas(sigmas, dists, noise=0.0):
@@ -624,7 +697,8 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
         rgb = raw[...,:3]  # [N_rays, N_samples, 3]
         sigma = raw[...,3]
         BG_rgb_map, FG_rgb_map, ACTOR_rgb_map = None, None, None
-        BG_acc_map, FG_acc_map, ACTOR_acc_map = None, None, None
+        FG_acc_map, ACTOR_acc_map = None, None
+        FG_embedding_map = None
     else:
         BG_rgb = raw[...,:3]
         FG_rgb = raw[...,3:6]
@@ -653,13 +727,16 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
         ACTOR_alphas = (ACTOR_sigma/sigma)*alphas
         ACTOR_alphas[:,-1:] = 1.-torch.exp(-F.relu(ACTOR_sigma + noise)*dists)[:,-1:]
 
-        if test_time: 
+        if test_time:
             BG_weights = BG_alphas * torch.cumprod(torch.cat([torch.ones((BG_alphas.shape[0], 1)), 1.-BG_alphas + 1e-10], -1), -1)[:, :-1]
             # FG_weights = FG_alphas * torch.cumprod(torch.cat([torch.ones((FG_alphas.shape[0], 1)), 1.-FG_alphas + 1e-10], -1), -1)[:, :-1]
             # ACTOR_weights = ACTOR_alphas * torch.cumprod(torch.cat([torch.ones((ACTOR_alphas.shape[0], 1)), 1.-ACTOR_alphas + 1e-10], -1), -1)[:, :-1]
             ### Hacky. Must remove in future!
-            FG_weights = FG_alphas * transmittance 
-            ACTOR_weights = ACTOR_alphas * transmittance
+            # FG_weights = FG_alphas * transmittance 
+            # ACTOR_weights = ACTOR_alphas * transmittance
+            ### Another hack
+            FG_weights = (FG_sigma/(FG_sigma+BG_sigma+1e-9))*alphas * transmittance 
+            ACTOR_weights = (ACTOR_sigma/(ACTOR_sigma+BG_sigma+1e-9))*alphas * transmittance
         else:
             BG_weights = BG_alphas * transmittance
             FG_weights = FG_alphas * transmittance
@@ -678,13 +755,20 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
         # adding beta_min as in NeRF-W
         uncertainty_map += 0.03
 
-    if raw.shape[-1] > 4:        
-        BG_rgb_map = torch.sum(BG_weights[...,None] * BG_rgb, -2)
-        FG_rgb_map = torch.sum(FG_weights[...,None] * FG_rgb, -2)
+    if raw.shape[-1] > 4:
+        BG_weights_temp = BG_alphas * torch.cumprod(torch.cat([torch.ones((BG_alphas.shape[0], 1)), 1.-BG_alphas + 1e-10], -1), -1)[:, :-1]
+        if test_time:
+            FG_weights_temp = (FG_sigma/(FG_sigma+BG_sigma+1e-9))*alphas * transmittance
+        else:
+            FG_weights_temp = FG_alphas * torch.cumprod(torch.cat([torch.ones((FG_alphas.shape[0], 1)), 1.-FG_alphas + 1e-10], -1), -1)[:, :-1]
+        BG_rgb_map = torch.sum(BG_weights_temp[...,None] * BG_rgb, -2)
+        FG_rgb_map = torch.sum(FG_weights_temp[...,None] * FG_rgb, -2)
         ACTOR_rgb_map = torch.sum(ACTOR_weights[...,None] * ACTOR_rgb, -2)
 
         FG_acc_map = torch.sum(FG_weights, -1)
         ACTOR_acc_map = torch.sum(ACTOR_weights, -1)
+
+        FG_embedding_map = torch.sum(FG_weights[...,None] * raw[...,14:], -2)
 
     sigma_L1 = torch.zeros(raw.shape[0])
     if raw.shape[-1] > 4 and not test_time:
@@ -707,7 +791,7 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     # entropy = Categorical(probs = weights+1e-5).entropy()
     # sparsity_loss = entropy * mask
 
-    return rgb_map, disp_map, acc_map, weights, depth_map, sigma_L1, uncertainty_map, BG_rgb_map, FG_rgb_map, ACTOR_rgb_map, FG_acc_map, ACTOR_acc_map
+    return rgb_map, disp_map, acc_map, weights, depth_map, sigma_L1, uncertainty_map, BG_rgb_map, FG_rgb_map, ACTOR_rgb_map, FG_acc_map, ACTOR_acc_map, FG_embedding_map
 
 
 def render_rays(ray_batch,
@@ -796,7 +880,7 @@ def render_rays(ray_batch,
 
 #     raw = run_network(pts)
     raw = network_query_fn(pts, pts_cam, viewdirs, viewdirs_cam, network_fn)
-    rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss, uncertainty_map, BG_rgb_map, FG_rgb_map, ACTOR_rgb_map, FG_acc_map, ACTOR_acc_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest, test_time=test_time, coarse=network_fn.coarse, sigma_cauchy=sigma_cauchy)
+    rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss, uncertainty_map, BG_rgb_map, FG_rgb_map, ACTOR_rgb_map, FG_acc_map, ACTOR_acc_map, FG_embedding_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest, test_time=test_time, coarse=network_fn.coarse, sigma_cauchy=sigma_cauchy)
 
     if N_importance > 0:
 
@@ -817,7 +901,7 @@ def render_rays(ray_batch,
 #         raw = run_network(pts, fn=run_fn)
         raw = network_query_fn(pts, pts_cam, viewdirs, viewdirs_cam, run_fn)
 
-        rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss, uncertainty_map, BG_rgb_map, FG_rgb_map, ACTOR_rgb_map, FG_acc_map, ACTOR_acc_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest, test_time=test_time, coarse=run_fn.coarse, sigma_cauchy=sigma_cauchy)
+        rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss, uncertainty_map, BG_rgb_map, FG_rgb_map, ACTOR_rgb_map, FG_acc_map, ACTOR_acc_map, FG_embedding_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest, test_time=test_time, coarse=run_fn.coarse, sigma_cauchy=sigma_cauchy)
 
     ret = {'rgb_map' : rgb_map, 'disp_map' : disp_map, 'acc_map' : acc_map, 'sparsity_loss': sparsity_loss}
     ret["BG_rgb_map"] = BG_rgb_map
@@ -825,6 +909,7 @@ def render_rays(ray_batch,
     ret["ACTOR_rgb_map"] = ACTOR_rgb_map
     ret["FG_acc_map"] = FG_acc_map
     ret["ACTOR_acc_map"] = ACTOR_acc_map
+    ret["FG_embedding_map"] = FG_embedding_map
 
     if uncertainty_map is not None:
         ret['uncertainty_map'] = uncertainty_map
@@ -970,26 +1055,16 @@ def config_parser():
                         help='learning rate')
     parser.add_argument("--use-uncertainties", action='store_true', 
                         help='use gaussian observation loss with uncertainty')
-    parser.add_argument("--only-background", action='store_true', 
-                        help='train only the static/background model')
-    parser.add_argument("--only-foreground", action='store_true', 
-                        help='train only the dynamic/foreground model')
     parser.add_argument("--big", action='store_true', 
                         help='use bigger actor and foreground model')
     parser.add_argument("--big-time", action='store_true', 
                         help='use bigger embedding for time')
     parser.add_argument("--big-world-embed", action='store_true', 
                         help='use bigger size for world embeddings')
-    parser.add_argument("--actor-small-embed", action='store_true', 
-                        help='Less levels for actor embedding')
-    parser.add_argument("--small-actor-MLP", action='store_true', 
-                        help='Less levels for actor embedding')
     parser.add_argument("--actor-high-freq", action='store_true', 
                         help='high freq for actor embedding')
     parser.add_argument("--fixed-adaptive-loss", action='store_true', 
                         help='fixed version of adaptive loss')
-    parser.add_argument("--sigma-cauchy", action='store_true', 
-                        help='Use cauchy loss for sigma values')
     parser.add_argument("--bg-fg-separate", action='store_true', 
                         help='separate embedding grids for BG/FG')
     parser.add_argument("--entropy-weight", type=float, default=0.0,
@@ -998,6 +1073,33 @@ def config_parser():
                         help='use XYZT model')
     parser.add_argument("--no-views-FG", action='store_true', 
                         help='dont use views for FG in XYZT model')
+    parser.add_argument("--use-actor-xyzt", action='store_true', 
+                        help='use Actor model in XYZT model')
+    parser.add_argument("--scaled-tvloss", action='store_true', 
+                        help='Use scaled TV loss')
+    parser.add_argument("--small-MLPs-dynamic", action='store_true',
+                        help='Use small MLPs for foreground and actor models')
+    parser.add_argument("--xyzt-embed-levels", type=int, default=16, 
+                        help='number of levels in XYZT embeddings')
+    parser.add_argument("--bg-guided-loss", action='store_true', 
+                        help='Joao idea: weight loss with diff between GT and BG')
+    parser.add_argument("--bg-guided-sparsity", action='store_true', 
+                        help='BG guided sparsity constraint on FG sigmas')
+
+    ### The following didn't work:
+    # parser.add_argument("--entropy-color", action='store_true', 
+    #                     help='Use entropy loss for colors')
+    # parser.add_argument("--actor-small-embed", action='store_true', 
+    #                     help='Less levels for actor embedding')
+    # parser.add_argument("--small-actor-MLP", action='store_true', 
+    #                     help='Less levels for actor embedding')
+    # parser.add_argument("--only-background", action='store_true', 
+    #                     help='train only the static/background model')
+    # parser.add_argument("--only-foreground", action='store_true', 
+    #                     help='train only the dynamic/foreground model')
+    # parser.add_argument("--sigma-cauchy", action='store_true', 
+    #                     help='Use cauchy loss for sigma values')
+    
     return parser
 
 
@@ -1010,7 +1112,7 @@ def train():
     K = None
 
     if args.dataset_type=="epic_kitchens":
-        images, poses, hwf, i_split, bounding_box, bounding_box_incameraframe, near_far, all_frame_idxs = load_epic_kitchens_data(args.datadir)
+        images, mask_gts, poses, hwf, i_split, bounding_box, bounding_box_incameraframe, near_far, all_frame_idxs = load_epic_kitchens_data(args.datadir)
         near, far = near_far
         
         args.bounding_box = bounding_box
@@ -1043,22 +1145,17 @@ def train():
 
     # Create log dir and copy the config file
     basedir = args.basedir
-    # if args.i_embed==1:
-    #     args.expname += "_hashXYZ"
-    # elif args.i_embed==0:
-    #     args.expname += "_posXYZ"
-    # if args.i_embed_views==2:
-    #     args.expname += "_sphereVIEW"
-    # elif args.i_embed_views==0:
-    #     args.expname += "_posVIEW"
     args.expname += "_fine"+str(args.finest_res) + "_log2T"+str(args.log2_hashmap_size)
     args.expname += "_lr"+str(args.lrate) + "_decay"+str(args.lrate_decay)
     if not args.xyzt_model:
         args.expname += "_NeuralDiffsig_CoarseAdapt"
     else:
         args.expname += "_BGFG_XYZT"
+        if args.use_actor_xyzt:
+            args.expname += "withAct"
+        args.expname += "_lev"+str(args.xyzt_embed_levels)
     if args.fixed_adaptive_loss:
-        args.expname += "Fixed"
+        args.expname += "_Fixed"
     if args.use_uncertainties:
         args.expname += "_withUncert"
     if args.big:
@@ -1068,29 +1165,28 @@ def train():
         args.expname += "_BigTime"
     if args.big_world_embed:
         args.expname += "_BWor"
-    if args.only_background or args.only_foreground:
-        args.expname += "_STATIC"
     if args.sparse_loss_weight > 0:
-        if args.sigma_cauchy:
-            args.expname += "_cauchy" + str(args.sparse_loss_weight)
-        else:
-            args.expname += "_sparse" + str(args.sparse_loss_weight)
+        args.expname += "_sparse" + str(args.sparse_loss_weight)
     if args.entropy_weight > 0:
         args.expname += "_ent" + str(args.entropy_weight)
-    args.expname += "_TV" + str(args.tv_loss_weight)
+    args.expname += "_scTV" if args.scaled_tvloss else "_TV"
+    args.expname += "4D" if args.xyzt_model else ""
+    args.expname += str(args.tv_loss_weight)
     if args.bg_fg_separate:
         args.expname += "_BGFGDiff"
     else:
         args.expname += "_BGFGsame"
     args.expname += "_BGsignoise"
-    if args.actor_small_embed:
-        args.expname += "_ActSmallEmb"
-    if args.small_actor_MLP:
-        args.expname += "_smallActMLP"
     if args.actor_high_freq:
         args.expname += "_ActHighFreq"
     if args.no_views_FG:
         args.expname += "_NoViewsFG"
+    if args.small_MLPs_dynamic:
+        args.expname += "_smMLPs"
+    if args.bg_guided_loss:
+        args.expname += "_BGguided"
+    if args.bg_guided_sparsity:
+        args.expname += "_BGSparsityHSVallch"
     expname = args.expname   
 
     os.makedirs(os.path.join(basedir, expname), exist_ok=True)
@@ -1105,7 +1201,7 @@ def train():
             file.write(open(args.config, 'r').read())
 
     # Create nerf model
-    render_kwargs_train, render_kwargs_test, start, adaptive_loss, optimizer = create_nerf(args)
+    render_kwargs_train, render_kwargs_test, start, adaptive_loss, BGguided_loss, BGguided_sparsity, optimizer = create_nerf(args)
     global_step = start
 
     bds_dict = {
@@ -1129,12 +1225,13 @@ def train():
             else:
                 # Default is smoother render_poses path
                 images = None
+                mask_gts = None
 
             testsavedir = os.path.join(basedir, expname, 'renderonly_{}_{:06d}'.format('test' if args.render_test else 'path', start))
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', render_poses.shape)
 
-            rgbs, _, uncertainty_maps = render_path(render_poses, render_frame_idxs, hwf, K, args.chunk, render_kwargs_test, gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
+            rgbs, _, uncertainty_maps = render_path(render_poses, render_frame_idxs, hwf, K, args.chunk, render_kwargs_test, gt_imgs=images, mask_gts=mask_gts, savedir=testsavedir, render_factor=args.render_factor)
             print('Done rendering', testsavedir)
             imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
             if len(uncertainty_maps)>0:
@@ -1145,7 +1242,7 @@ def train():
     if args.render_fixed_viewpoint_video:
         print("RENDER from a Fixed View-point")
         with torch.no_grad():
-            fixed_pose_idx = 716
+            fixed_pose_idx = 608
             # fixed_pose = render_poses[fixed_pose_idx]
             # fixed_poses = fixed_pose.repeat(all_frame_idxs.shape[0], 1, 1) # repeat for number of frames
             
@@ -1265,7 +1362,12 @@ def train():
         if 'uncertainty_map' not in extras:
             img_loss = img2mse(rgb, target_s)
         else:
-            img_loss = img2mse_with_uncertainty(rgb, target_s, extras['uncertainty_map'].unsqueeze(-1))
+            if args.bg_guided_loss:
+                img_loss = BGguided_loss(target_s, extras['BG_rgb_map'], extras['FG_rgb_map'], extras['FG_acc_map'], extras['uncertainty_map'], iter=i)
+            else:
+                img_loss = img2mse_with_uncertainty(rgb, target_s, extras['uncertainty_map'].unsqueeze(-1))
+
+
 
         trans = extras['raw'][...,-1]
         loss = img_loss
@@ -1284,6 +1386,8 @@ def train():
             loss = loss + img_loss0
             psnr0 = mse2psnr(img_loss0)
 
+        if args.bg_guided_sparsity:
+            extras["sparsity_loss"] = extras["sparsity_loss"] * BGguided_sparsity(target_s, extras['BG_rgb_map'])
         sparsity_loss = args.sparse_loss_weight*(extras["sparsity_loss"].mean() + extras["sparsity_loss0"].mean())
         loss = loss + sparsity_loss
 
@@ -1294,6 +1398,12 @@ def train():
             entropy = Categorical(probs = torch.stack([BG_sigma/sigma, FG_sigma/sigma, ACTOR_sigma/sigma], dim=-1) + 1e-8).entropy()
             entropy_loss = entropy.sum(dim=-1)
             loss = loss + args.entropy_weight*entropy_loss.mean()
+
+            if args.entropy_color:
+                BG_color, FG_color, ACTOR_color = extras["raw"][...,:3], extras["raw"][...,3:6], extras["raw"][...,6:9]
+                entropy_col = Categorical(probs = torch.stack([BG_color, FG_color, ACTOR_color], dim=-1) + 1e-8).entropy()
+                entropy_loss_col = entropy_col.sum(dim=-1)
+                loss = loss + args.entropy_weight*entropy_loss_col.mean()
        
         # add Total Variation loss
         if args.i_embed==1:
@@ -1306,10 +1416,17 @@ def train():
                     min_res = render_kwargs_train['embedders'][embed].base_resolution
                     max_res = render_kwargs_train['embedders'][embed].finest_resolution
                     log2_hashmap_size = render_kwargs_train['embedders'][embed].log2_hashmap_size
-                    TV_loss += 0.001*sum(total_variation_loss_3D(render_kwargs_train['embedders'][embed].embeddings[i], \
+
+                    if args.xyzt_model and embed in ['camera_grid_embed', 'world_grid_embed_FG']:
+                        tv_loss_fn = total_variation_loss_4D
+                    else:
+                        tv_loss_fn = total_variation_loss_3D
+
+                    TV_loss += 0.001*sum(tv_loss_fn(render_kwargs_train['embedders'][embed].embeddings[i], \
                                                     min_res, max_res, \
                                                     i, log2_hashmap_size, \
-                                                    n_levels=n_levels) for i in range(n_levels))
+                                                    n_levels=n_levels,
+                                                    scaled=args.scaled_tvloss) for i in range(n_levels))
                 
                 ### TV loss on time
                 if render_kwargs_train['embedders']['time_grid_embed'] is not None:
@@ -1321,7 +1438,8 @@ def train():
                     TV_loss += sum(total_variation_loss_1D(render_kwargs_train['embedders'][embed].embeddings[i], \
                                                     min_res, max_res, \
                                                     i, log2_hashmap_size, \
-                                                    n_levels=n_levels) for i in range(n_levels))
+                                                    n_levels=n_levels,
+                                                    scaled=args.scaled_tvloss) for i in range(n_levels))
 
                 loss = loss + args.tv_loss_weight * TV_loss
                 # if i>1000:
@@ -1391,13 +1509,19 @@ def train():
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', poses[i_test].shape)
             with torch.no_grad():
-                render_path(torch.Tensor(poses[i_test]).to(device), render_frame_idxs, hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
+                render_path(torch.Tensor(poses[i_test]).to(device), render_frame_idxs, hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], mask_gts=mask_gts, BGguided_loss=BGguided_loss, BGguided_sparsity=BGguided_sparsity, savedir=testsavedir)
             print('Saved test set')
 
 
     
         if i%args.i_print==0:
             tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
+            if args.bg_guided_loss:
+                threshold = 1.0 - torch.sigmoid(BGguided_loss.threshold_param)
+                tqdm.write(f"threshold: {threshold.item()} steepness: {BGguided_loss.steepness.item()}")
+            if args.bg_guided_sparsity:
+                threshold = 1.0 - torch.sigmoid(BGguided_sparsity.threshold_param)
+                tqdm.write(f"threshold: {threshold.item()}")
             loss_list.append(loss.item())
             psnr_list.append(psnr.item())
             time_list.append(t)

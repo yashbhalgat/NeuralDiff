@@ -3,6 +3,7 @@
 #################################################################
 import pdb
 import torch
+from tqdm import tqdm
 
 from ray_utils import get_rays, get_ray_directions, get_ndc_rays
 
@@ -82,17 +83,49 @@ def get_interval_vertices(t, bounding_range, resolution, log2_hashmap_size):
     return interval_min_vertex, interval_max_vertex, hashed_interval_indices
 
 
+# def get_bbox3d_for_epickitchens(metas, H, W, near, far):
+#     focal = metas["intrinsics"][0][0]
+#     poses = [torch.FloatTensor(metas["poses"][str(idx)]) for idx in metas["ids_train"]]
+
+#     # ray directions in camera coordinates
+#     directions = get_ray_directions(H, W, focal)
+
+#     min_bound = [100, 100, 100]
+#     max_bound = [-100, -100, -100]
+#     points = []
+#     for pose in poses:
+#         rays_o, rays_d = get_rays(directions, pose)
+
+#         def find_min_max(pt):
+#             for i in range(3):
+#                 if(min_bound[i] > pt[i]):
+#                     min_bound[i] = pt[i]
+#                 if(max_bound[i] < pt[i]):
+#                     max_bound[i] = pt[i]
+#             return
+
+#         for i in [0, W-1, H*W-W, H*W-1]:
+#             min_point = rays_o[i] + near*rays_d[i]
+#             max_point = rays_o[i] + far*rays_d[i]
+#             points += [min_point, max_point]
+#             find_min_max(min_point)
+#             find_min_max(max_point)
+
+#     return (torch.tensor(min_bound)-torch.tensor([4.0,4.0,4.0]), torch.tensor(max_bound)+torch.tensor([4.0,4.0,4.0]))
+
 def get_bbox3d_for_epickitchens(metas, H, W, near, far):
     focal = metas["intrinsics"][0][0]
     poses = [torch.FloatTensor(metas["poses"][str(idx)]) for idx in metas["ids_train"]]
 
     # ray directions in camera coordinates
     directions = get_ray_directions(H, W, focal)
+    directions = directions.view(-1,3)
+    directions = directions[[0, W-1, H*W-W, H*W-1]]
 
     min_bound = [100, 100, 100]
     max_bound = [-100, -100, -100]
-    points = []
-    for pose in poses:
+    print("Getting bounding box")
+    for pose in tqdm(poses):
         rays_o, rays_d = get_rays(directions, pose)
 
         def find_min_max(pt):
@@ -103,10 +136,9 @@ def get_bbox3d_for_epickitchens(metas, H, W, near, far):
                     max_bound[i] = pt[i]
             return
 
-        for i in [0, W-1, H*W-W, H*W-1]:
+        for i in range(4):
             min_point = rays_o[i] + near*rays_d[i]
             max_point = rays_o[i] + far*rays_d[i]
-            points += [min_point, max_point]
             find_min_max(min_point)
             find_min_max(max_point)
 

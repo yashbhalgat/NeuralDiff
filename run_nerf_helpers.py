@@ -12,9 +12,12 @@ from hash_encoding import HashEmbedder, SHEncoder, XYZplusT_HashEmbedder
 img2mse = lambda x, y : torch.mean((x - y) ** 2)
 img2L1 = lambda x, y : torch.mean(0.01 * (torch.sqrt(1 + ((x-y)**2).sum(dim=-1)/0.0001) - 1))
 img2mse_with_uncertainty = lambda x, y, u : torch.mean(((x - y) ** 2)/(2*(u+1e-9)**2) + torch.log((u+1e-9)**2))
+img2mse_perray = lambda x, y : ((x - y) ** 2).sum(dim=-1)
+img2mse_with_uncertainty_perray = lambda x, y, u : ((x - y) ** 2).sum(dim=-1)/(2*(u+1e-9)**2) + 0.5*torch.log((u+1e-9)**2)
 mse2psnr = lambda x : -10. * torch.log(x) / torch.log(torch.Tensor([10.]))
 to8b = lambda x : (255*np.clip(x,0,1)).astype(np.uint8)
 relu_act = nn.Softplus()
+bce_loss = nn.BCELoss()
 
 # Positional encoding (section 5.1)
 class Embedder:
@@ -705,15 +708,23 @@ class BGFG_XYZT(nn.Module):
                  input_ch=4, input_cam_ch=4,
                  input_ch_views=3, input_ch_views_cam=3,
                  use_uncertainties=False,
-                 static_grid=None, xyzt_grid=None,
+                 static_grid=None, xyzt_grid=None, xyzt_grid_cam=None,
                  coarse=True,
-                 use_viewdirs_FG=False):
+                 use_viewdirs_FG=False,
+                 use_actor=False,
+                 small_MLPs_dyn=False):
         super(BGFG_XYZT, self).__init__()
 
         self.input_ch, self.input_cam_ch = input_ch, input_cam_ch # it's raw xyzt, so input_ch=4
         self.input_ch_views, self.input_ch_views_cam = input_ch_views, input_ch_views_cam # has embedded views
 
         self.num_layers, self.num_layers_color, self.hidden_dim = num_layers, num_layers_color, hidden_dim
+        self.small_MLPs_dyn = small_MLPs_dyn
+        if small_MLPs_dyn:
+            self.num_layers_dyn, self.num_layers_color_dyn = 1, 1
+        else:
+            self.num_layers_dyn, self.num_layers_color_dyn = num_layers, num_layers_color
+
         self.geo_feat_dim = geo_feat_dim
         self.num_layers_FG = num_layers_FG
         if coarse:
@@ -722,10 +733,13 @@ class BGFG_XYZT(nn.Module):
             self.use_uncertainties = use_uncertainties
         self.coarse = coarse # Is this a coarse model?
         self.use_viewdirs_FG = use_viewdirs_FG
+        self.use_actor = use_actor
 
         self.static_grid = static_grid
         if not coarse: # if this is a "fine" model, use dynamic components
             self.xyzt_grid = xyzt_grid # separate high freq grid for FG
+            if self.use_actor:
+                self.xyzt_grid_cam = xyzt_grid_cam 
 
         ### Background Network
         self.BG_sigma_net, self.BG_color_net = create_sigma_and_color_MLP(num_layers, num_layers_color,
@@ -735,17 +749,26 @@ class BGFG_XYZT(nn.Module):
 
         if not coarse: # if this is a "fine" model, use dynamic components
             ### Foreground Network
-            self.FG_sigma_net, self.FG_color_net = create_sigma_and_color_MLP(num_layers, num_layers_color,
+            self.FG_sigma_net, self.FG_color_net = create_sigma_and_color_MLP(self.num_layers_dyn, self.num_layers_color_dyn,
                                                                     hidden_dim, 53, # 53 is random! bad code, sorry :(
-                                                                    self.xyzt_grid.out_dim, # only XYZ
+                                                                    self.xyzt_grid.out_dim,
                                                                     input_ch_views, geo_feat_dim,
                                                                     use_viewdirs=use_viewdirs_FG)
+            if self.use_actor:            
+                ### Actor Network
+                self.ACTOR_sigma_net, self.ACTOR_color_net = create_sigma_and_color_MLP(self.num_layers_dyn, self.num_layers_color_dyn,
+                                                                        hidden_dim, 53, # 53 is random! bad code, sorry :(
+                                                                        self.xyzt_grid_cam.out_dim,
+                                                                        input_ch_views, geo_feat_dim,
+                                                                        use_viewdirs=use_viewdirs_FG)
 
     def forward(self, x):
-        input_pts, input_pts_cam, input_views, _ = torch.split(x, [self.input_ch, self.input_cam_ch, self.input_ch_views, self.input_ch_views_cam], dim=-1)
+        input_pts, input_pts_cam, input_views, input_views_cam = torch.split(x, [self.input_ch, self.input_cam_ch, self.input_ch_views, self.input_ch_views_cam], dim=-1)
         embedded_xyz, keep_mask = self.static_grid(input_pts[...,:3])
         if not self.coarse:
             embedded_xyzt, keep_mask_FG = self.xyzt_grid(input_pts)
+            if self.use_actor:
+                embedded_xyzt_cam, keep_mask_ACTOR = self.xyzt_grid_cam(input_pts_cam)
         
         ### Static components
         BG_sigma, BG_color, _ = forward_through_MLP(self.BG_sigma_net, self.BG_color_net, \
@@ -756,23 +779,26 @@ class BGFG_XYZT(nn.Module):
 
         ### Dynamic components
         if not self.coarse:
-            if self.use_viewdirs_FG:
-                FG_sigma, FG_color, FG_uncertainties = forward_through_MLP(self.FG_sigma_net, self.FG_color_net, \
-                                                                        embedded_xyzt, input_views, \
-                                                                        self.num_layers, self.num_layers_color)
-            else:
-                FG_sigma, FG_color, FG_uncertainties = forward_through_MLP(self.FG_sigma_net, self.FG_color_net, \
-                                                                        embedded_xyzt, None, \
-                                                                        self.num_layers, self.num_layers_color)
+            FG_sigma, FG_color, FG_uncertainties = forward_through_MLP(self.FG_sigma_net, self.FG_color_net, \
+                                                                    embedded_xyzt, input_views if self.use_viewdirs_FG else None, \
+                                                                    self.num_layers_dyn, self.num_layers_color_dyn)
             FG_color = F.sigmoid(FG_color)
             FG_sigma, FG_color = FG_sigma*keep_mask_FG, FG_color*keep_mask_FG[:,None]
+
+            if self.use_actor:
+                ACTOR_sigma, ACTOR_color, ACTOR_uncertainties = forward_through_MLP(self.ACTOR_sigma_net, self.ACTOR_color_net, \
+                                                                    embedded_xyzt_cam, input_views_cam if self.use_viewdirs_FG else None, \
+                                                                    self.num_layers_dyn, self.num_layers_color_dyn)
+                ACTOR_color = F.sigmoid(ACTOR_color)
+                ACTOR_sigma, ACTOR_color = ACTOR_sigma*keep_mask_ACTOR, ACTOR_color*keep_mask_ACTOR[:,None]
+            else:
+                ### we don't have actor, but doing this to make the code consistent
+                ACTOR_sigma, ACTOR_color = torch.zeros_like(BG_sigma), torch.zeros_like(BG_color) 
+                ACTOR_uncertainties = torch.zeros_like(FG_uncertainties)
+                ##################            
         else:
             FG_sigma, FG_color, FG_uncertainties = torch.zeros_like(BG_sigma), torch.zeros_like(BG_color), None
-
-        ### we don't have actor, but doing this to make the code consistent
-        ACTOR_sigma, ACTOR_color = torch.zeros_like(BG_sigma), torch.zeros_like(BG_color) 
-        ACTOR_uncertainties = torch.zeros_like(FG_uncertainties) if not self.coarse else None
-        ##################
+            ACTOR_sigma, ACTOR_color, ACTOR_uncertainties = torch.zeros_like(BG_sigma), torch.zeros_like(BG_color), None
 
         # Principled color mixing
         sigma = BG_sigma + FG_sigma + ACTOR_sigma + 1e-9
@@ -781,7 +807,8 @@ class BGFG_XYZT(nn.Module):
         if self.use_uncertainties:
             return torch.cat([BG_color, FG_color, ACTOR_color, # :3, 3:6, 6:9
                                 BG_sigma.unsqueeze(dim=-1), FG_sigma.unsqueeze(dim=-1), ACTOR_sigma.unsqueeze(dim=-1), # 9, 10, 11
-                                FG_uncertainties.unsqueeze(dim=-1), ACTOR_uncertainties.unsqueeze(dim=-1)], -1) # 12, 13
+                                FG_uncertainties.unsqueeze(dim=-1), ACTOR_uncertainties.unsqueeze(dim=-1), # 12, 13
+                                embedded_xyzt], -1) # 14:
         else:
             return torch.cat([color, sigma.unsqueeze(dim=-1)], -1)
 
