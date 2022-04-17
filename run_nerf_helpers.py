@@ -6,6 +6,7 @@ import numpy as np
 import pdb
 
 from hash_encoding import HashEmbedder, SHEncoder, XYZplusT_HashEmbedder
+from time_encoding import XYZ_TimeOnOff_Encoding, XYZ_TimePiecewiseConstant
 
 # Misc
 
@@ -796,6 +797,176 @@ class BGFG_XYZT(nn.Module):
                 ACTOR_sigma, ACTOR_color = torch.zeros_like(BG_sigma), torch.zeros_like(BG_color) 
                 ACTOR_uncertainties = torch.zeros_like(FG_uncertainties)
                 ##################            
+        else:
+            FG_sigma, FG_color, FG_uncertainties = torch.zeros_like(BG_sigma), torch.zeros_like(BG_color), None
+            ACTOR_sigma, ACTOR_color, ACTOR_uncertainties = torch.zeros_like(BG_sigma), torch.zeros_like(BG_color), None
+
+        # Principled color mixing
+        sigma = BG_sigma + FG_sigma + ACTOR_sigma + 1e-9
+        color = (BG_sigma/sigma)[:,None] * BG_color + (FG_sigma/sigma)[:,None] * FG_color + (ACTOR_sigma/sigma)[:,None] * ACTOR_color
+
+        if self.use_uncertainties:
+            return torch.cat([BG_color, FG_color, ACTOR_color, # :3, 3:6, 6:9
+                                BG_sigma.unsqueeze(dim=-1), FG_sigma.unsqueeze(dim=-1), ACTOR_sigma.unsqueeze(dim=-1), # 9, 10, 11
+                                FG_uncertainties.unsqueeze(dim=-1), ACTOR_uncertainties.unsqueeze(dim=-1), # 12, 13
+                                embedded_xyzt], -1) # 14:
+        else:
+            return torch.cat([color, sigma.unsqueeze(dim=-1)], -1)
+
+
+class BGFG_OnOffEncoding(nn.Module):
+    '''
+    Uses OnOffEncoding for time
+    '''
+    def __init__(self,
+                 t_bounds,
+                 num_layers=3,
+                 hidden_dim=64,
+                 geo_feat_dim=15,
+                 num_layers_color=4,
+                 input_ch=4, input_cam_ch=4,
+                 input_ch_views=3, input_ch_views_cam=3,
+                 use_uncertainties=False,
+                 static_grid=None, FG_xyz_grid=None,
+                 coarse=True):
+        super(BGFG_OnOffEncoding, self).__init__()
+
+        self.input_ch, self.input_cam_ch = input_ch, input_cam_ch # it's raw xyzt, so input_ch=4
+        self.input_ch_views, self.input_ch_views_cam = input_ch_views, input_ch_views_cam # has embedded views
+
+        self.num_layers, self.num_layers_color, self.hidden_dim = num_layers, num_layers_color, hidden_dim
+        
+        self.geo_feat_dim = geo_feat_dim
+        self.use_uncertainties = False if coarse else use_uncertainties
+        self.coarse = coarse # Is this a coarse model?
+        
+        self.static_grid = static_grid
+        if not coarse: # if this is a "fine" model, use dynamic components
+            self.FG_xyzt_encoder = XYZ_TimeOnOff_Encoding(xyz_encoder=FG_xyz_grid, t_bounds=t_bounds)
+            
+        ### Background Network
+        self.BG_sigma_net, self.BG_color_net = create_sigma_and_color_MLP(num_layers, num_layers_color,
+                                                                    hidden_dim, 53, # 53 is random! bad code, sorry :(
+                                                                    self.static_grid.out_dim, # only XYZ
+                                                                    input_ch_views, geo_feat_dim)
+
+        if not coarse: # if this is a "fine" model, use dynamic components
+            ### Foreground Network
+            self.FG_sigma_net, self.FG_color_net = create_sigma_and_color_MLP(num_layers, num_layers_color,
+                                                                    hidden_dim, 53, # 53 is random! bad code, sorry :(
+                                                                    self.FG_xyzt_encoder.out_dim,
+                                                                    input_ch_views, geo_feat_dim,
+                                                                    use_viewdirs=False)
+            
+    def forward(self, x):
+        input_pts, input_pts_cam, input_views, input_views_cam = torch.split(x, [self.input_ch, self.input_cam_ch, self.input_ch_views, self.input_ch_views_cam], dim=-1)
+        embedded_xyz, keep_mask = self.static_grid(input_pts[...,:3])
+        if not self.coarse:
+            embedded_xyzt = self.FG_xyzt_encoder(input_pts)
+            
+        ### Static components
+        BG_sigma, BG_color, _ = forward_through_MLP(self.BG_sigma_net, self.BG_color_net, \
+                                                    embedded_xyz, input_views, \
+                                                    self.num_layers, self.num_layers_color)
+        BG_color = F.sigmoid(BG_color)
+        BG_sigma, BG_color = BG_sigma*keep_mask, BG_color*keep_mask[:,None]
+
+        ### Dynamic components
+        if not self.coarse:
+            FG_sigma, FG_color, FG_uncertainties = forward_through_MLP(self.FG_sigma_net, self.FG_color_net, \
+                                                                    embedded_xyzt, None, \
+                                                                    self.num_layers, self.num_layers_color)
+            FG_color = F.sigmoid(FG_color)
+
+            ### we don't have actor, but doing this to make the code consistent
+            ACTOR_sigma, ACTOR_color = torch.zeros_like(BG_sigma), torch.zeros_like(BG_color) 
+            ACTOR_uncertainties = torch.zeros_like(FG_uncertainties)
+            ##################            
+        else:
+            FG_sigma, FG_color, FG_uncertainties = torch.zeros_like(BG_sigma), torch.zeros_like(BG_color), None
+            ACTOR_sigma, ACTOR_color, ACTOR_uncertainties = torch.zeros_like(BG_sigma), torch.zeros_like(BG_color), None
+
+        # Principled color mixing
+        sigma = BG_sigma + FG_sigma + ACTOR_sigma + 1e-9
+        color = (BG_sigma/sigma)[:,None] * BG_color + (FG_sigma/sigma)[:,None] * FG_color + (ACTOR_sigma/sigma)[:,None] * ACTOR_color
+
+        if self.use_uncertainties:
+            return torch.cat([BG_color, FG_color, ACTOR_color, # :3, 3:6, 6:9
+                                BG_sigma.unsqueeze(dim=-1), FG_sigma.unsqueeze(dim=-1), ACTOR_sigma.unsqueeze(dim=-1), # 9, 10, 11
+                                FG_uncertainties.unsqueeze(dim=-1), ACTOR_uncertainties.unsqueeze(dim=-1), # 12, 13
+                                embedded_xyzt], -1) # 14:
+        else:
+            return torch.cat([color, sigma.unsqueeze(dim=-1)], -1)
+
+
+class BGFG_PiecewiseConst(nn.Module):
+    '''
+    Uses OnOffEncoding for time
+    '''
+    def __init__(self,
+                 xyzt_bounds,
+                 num_layers=3,
+                 hidden_dim=64,
+                 geo_feat_dim=15,
+                 num_layers_color=4,
+                 input_ch=4, input_cam_ch=4,
+                 input_ch_views=3, input_ch_views_cam=3,
+                 use_uncertainties=False,
+                 static_grid=None,
+                 coarse=True):
+        super(BGFG_PiecewiseConst, self).__init__()
+
+        self.input_ch, self.input_cam_ch = input_ch, input_cam_ch # it's raw xyzt, so input_ch=4
+        self.input_ch_views, self.input_ch_views_cam = input_ch_views, input_ch_views_cam # has embedded views
+
+        self.num_layers, self.num_layers_color, self.hidden_dim = num_layers, num_layers_color, hidden_dim
+        
+        self.geo_feat_dim = geo_feat_dim
+        self.use_uncertainties = False if coarse else use_uncertainties
+        self.coarse = coarse # Is this a coarse model?
+        
+        self.static_grid = static_grid
+        if not coarse: # if this is a "fine" model, use dynamic components
+            self.FG_xyzt_encoder = XYZ_TimePiecewiseConstant(xyzt_bounds=xyzt_bounds)
+            
+        ### Background Network
+        self.BG_sigma_net, self.BG_color_net = create_sigma_and_color_MLP(num_layers, num_layers_color,
+                                                                    hidden_dim, 53, # 53 is random! bad code, sorry :(
+                                                                    self.static_grid.out_dim, # only XYZ
+                                                                    input_ch_views, geo_feat_dim)
+
+        if not coarse: # if this is a "fine" model, use dynamic components
+            ### Foreground Network
+            self.FG_sigma_net, self.FG_color_net = create_sigma_and_color_MLP(num_layers, num_layers_color,
+                                                                    hidden_dim, 53, # 53 is random! bad code, sorry :(
+                                                                    self.FG_xyzt_encoder.out_dim,
+                                                                    input_ch_views, geo_feat_dim,
+                                                                    use_viewdirs=False)
+            
+    def forward(self, x):
+        input_pts, input_pts_cam, input_views, input_views_cam = torch.split(x, [self.input_ch, self.input_cam_ch, self.input_ch_views, self.input_ch_views_cam], dim=-1)
+        embedded_xyz, keep_mask = self.static_grid(input_pts[...,:3])
+        if not self.coarse:
+            embedded_xyzt = self.FG_xyzt_encoder(input_pts)
+            
+        ### Static components
+        BG_sigma, BG_color, _ = forward_through_MLP(self.BG_sigma_net, self.BG_color_net, \
+                                                    embedded_xyz, input_views, \
+                                                    self.num_layers, self.num_layers_color)
+        BG_color = F.sigmoid(BG_color)
+        BG_sigma, BG_color = BG_sigma*keep_mask, BG_color*keep_mask[:,None]
+
+        ### Dynamic components
+        if not self.coarse:
+            FG_sigma, FG_color, FG_uncertainties = forward_through_MLP(self.FG_sigma_net, self.FG_color_net, \
+                                                                    embedded_xyzt, None, \
+                                                                    self.num_layers, self.num_layers_color)
+            FG_color = F.sigmoid(FG_color)
+
+            ### we don't have actor, but doing this to make the code consistent
+            ACTOR_sigma, ACTOR_color = torch.zeros_like(BG_sigma), torch.zeros_like(BG_color) 
+            ACTOR_uncertainties = torch.zeros_like(FG_uncertainties)
+            ##################            
         else:
             FG_sigma, FG_color, FG_uncertainties = torch.zeros_like(BG_sigma), torch.zeros_like(BG_color), None
             ACTOR_sigma, ACTOR_color, ACTOR_uncertainties = torch.zeros_like(BG_sigma), torch.zeros_like(BG_color), None

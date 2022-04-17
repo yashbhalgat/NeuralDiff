@@ -1,16 +1,10 @@
 import math
-import os, sys
-from sqlite3 import adapt
-from datetime import datetime
-from unittest import installHandler
+import os
 import numpy as np
 import imageio
-import json
 import pdb
-import random
 import time
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
 from tqdm import tqdm, trange
@@ -28,7 +22,6 @@ from extra_losses import *
 from hash_encoding import HashEmbedder, XYZplusT_HashEmbedder, Linear_HashEmbedder
 from robust_loss_pytorch.adaptive import AdaptiveLossFunction
 from robust_loss_pytorch.general import lossfun
-from vgg import Vgg16
 
 from load_epic_kitchens import load_epic_kitchens_data
 
@@ -439,7 +432,7 @@ def create_nerf(args):
                         log2_hashmap_size=args.log2_hashmap_size, \
                         finest_resolution=args.finest_res)
     world_grid_embed_FG = None
-    if args.bg_fg_separate:
+    if args.bg_fg_separate or args.on_off_encoding:
         # high freq embedding for FG
         world_grid_embed_FG = HashEmbedder(bounding_box=xyz_bounding_box, \
                                 n_features_per_level=4 if args.big_world_embed else 2, \
@@ -451,7 +444,7 @@ def create_nerf(args):
                                 n_levels=args.xyzt_embed_levels, \
                                 n_features_per_level=4 if args.big_world_embed else 2, \
                                 base_resolution=128,
-                                log2_hashmap_size=args.log2_hashmap_size + 3, \
+                                log2_hashmap_size=args.log2_hashmap_size, \
                                 finest_resolution=args.finest_res*4)
 
     camera_grid_embed, time_grid_embed = None, None
@@ -461,11 +454,10 @@ def create_nerf(args):
                             n_levels=args.xyzt_embed_levels, \
                             n_features_per_level=2, \
                             base_resolution=128,
-                            log2_hashmap_size=args.log2_hashmap_size + 3, \
+                            log2_hashmap_size=args.log2_hashmap_size, \
                             finest_resolution=args.finest_res*4)
     else:
         camera_grid_embed = HashEmbedder(bounding_box=xyz_bounding_box_cam, \
-                            n_levels=4 if args.actor_small_embed else 16,
                             base_resolution=128 if args.actor_high_freq else 16,
                             log2_hashmap_size=args.log2_hashmap_size, \
                             finest_resolution=args.finest_res)
@@ -482,18 +474,7 @@ def create_nerf(args):
     else:
         model_class = NeuralDiff
 
-    if not args.xyzt_model:
-        model = model_class(num_layers=2,
-                        hidden_dim=64,
-                        geo_feat_dim=15,
-                        num_layers_color=3,
-                        input_ch=input_ch, input_cam_ch=input_ch,
-                        input_ch_views=input_ch_views, input_ch_views_cam=input_ch_views,
-                        use_uncertainties=args.use_uncertainties,
-                        world_grid_embed=world_grid_embed, world_grid_embed_FG=world_grid_embed_FG, camera_grid_embed=camera_grid_embed, time_grid_embed=time_grid_embed,
-                        big=args.big,
-                        coarse=True).to(device)
-    else:
+    if args.xyzt_model:
         model = BGFG_XYZT(num_layers=2,
                         hidden_dim=64,
                         geo_feat_dim=15,
@@ -504,6 +485,39 @@ def create_nerf(args):
                         static_grid=world_grid_embed, xyzt_grid=world_grid_embed_FG, xyzt_grid_cam=camera_grid_embed,
                         coarse=True,
                         use_viewdirs_FG=not args.no_views_FG).to(device)
+    elif args.on_off_encoding:
+        model = BGFG_OnOffEncoding(t_bounds=t_bounding_range,
+                                   num_layers=2,
+                                   hidden_dim=64,
+                                   geo_feat_dim=15,
+                                   num_layers_color=3,
+                                   input_ch=input_ch, input_cam_ch=input_ch,
+                                   input_ch_views=input_ch_views, input_ch_views_cam=input_ch_views,
+                                   use_uncertainties=args.use_uncertainties,
+                                   static_grid=world_grid_embed, FG_xyz_grid=None,
+                                   coarse=True).to(device)
+    elif args.piecewise_constant:
+        model = BGFG_PiecewiseConst(xyzt_bounds=args.bounding_box,
+                                   num_layers=2,
+                                   hidden_dim=64,
+                                   geo_feat_dim=15,
+                                   num_layers_color=3,
+                                   input_ch=input_ch, input_cam_ch=input_ch,
+                                   input_ch_views=input_ch_views, input_ch_views_cam=input_ch_views,
+                                   use_uncertainties=args.use_uncertainties,
+                                   static_grid=world_grid_embed,
+                                   coarse=True).to(device)
+    else:
+        model = model_class(num_layers=2,
+                        hidden_dim=64,
+                        geo_feat_dim=15,
+                        num_layers_color=3,
+                        input_ch=input_ch, input_cam_ch=input_ch,
+                        input_ch_views=input_ch_views, input_ch_views_cam=input_ch_views,
+                        use_uncertainties=args.use_uncertainties,
+                        world_grid_embed=world_grid_embed, world_grid_embed_FG=world_grid_embed_FG, camera_grid_embed=camera_grid_embed, time_grid_embed=time_grid_embed,
+                        big=args.big,
+                        coarse=True).to(device)
     
     embedding_params = []
     grad_vars = []
@@ -521,18 +535,7 @@ def create_nerf(args):
         else:
             model_class = NeuralDiff
         
-        if not args.xyzt_model:
-            model_fine = model_class(num_layers=2,
-                            hidden_dim=64,
-                            geo_feat_dim=15,
-                            num_layers_color=3,
-                            input_ch=input_ch, input_cam_ch=input_ch,
-                            input_ch_views=input_ch_views, input_ch_views_cam=input_ch_views,
-                            use_uncertainties=args.use_uncertainties,
-                            world_grid_embed=world_grid_embed, world_grid_embed_FG=world_grid_embed_FG, camera_grid_embed=camera_grid_embed, time_grid_embed=time_grid_embed,
-                            big=args.big,
-                            coarse=False).to(device)
-        else:
+        if args.xyzt_model:
             model_fine = BGFG_XYZT(num_layers=2,
                             hidden_dim=64,
                             geo_feat_dim=15,
@@ -545,7 +548,40 @@ def create_nerf(args):
                             use_viewdirs_FG=not args.no_views_FG,
                             use_actor=args.use_actor_xyzt,
                             small_MLPs_dyn=args.small_MLPs_dynamic).to(device)
-        
+        elif args.on_off_encoding:
+            model_fine = BGFG_OnOffEncoding(t_bounds=t_bounding_range,
+                                            num_layers=2,
+                                            hidden_dim=64,
+                                            geo_feat_dim=15,
+                                            num_layers_color=3,
+                                            input_ch=input_ch, input_cam_ch=input_ch,
+                                            input_ch_views=input_ch_views, input_ch_views_cam=input_ch_views,
+                                            use_uncertainties=args.use_uncertainties,
+                                            static_grid=world_grid_embed, FG_xyz_grid=world_grid_embed_FG,
+                                            coarse=False).to(device)
+        elif args.piecewise_constant:
+            model_fine = BGFG_PiecewiseConst(xyzt_bounds=args.bounding_box,
+                                            num_layers=2,
+                                            hidden_dim=64,
+                                            geo_feat_dim=15,
+                                            num_layers_color=3,
+                                            input_ch=input_ch, input_cam_ch=input_ch,
+                                            input_ch_views=input_ch_views, input_ch_views_cam=input_ch_views,
+                                            use_uncertainties=args.use_uncertainties,
+                                            static_grid=world_grid_embed,
+                                            coarse=False).to(device)
+        else:
+            model_fine = model_class(num_layers=2,
+                            hidden_dim=64,
+                            geo_feat_dim=15,
+                            num_layers_color=3,
+                            input_ch=input_ch, input_cam_ch=input_ch,
+                            input_ch_views=input_ch_views, input_ch_views_cam=input_ch_views,
+                            use_uncertainties=args.use_uncertainties,
+                            world_grid_embed=world_grid_embed, world_grid_embed_FG=world_grid_embed_FG, camera_grid_embed=camera_grid_embed, time_grid_embed=time_grid_embed,
+                            big=args.big,
+                            coarse=False).to(device)
+
         for _, child in model_fine.named_children():
             if isinstance(child, HashEmbedder) or isinstance(child, Linear_HashEmbedder) or isinstance(child, XYZplusT_HashEmbedder):
                 embedding_params += list(child.parameters())
@@ -1051,8 +1087,8 @@ def config_parser():
                         help='log2 of hashmap size')
     parser.add_argument("--sparse-loss-weight", type=float, default=1e-10,
                         help='learning rate')
-    parser.add_argument("--tv-loss-weight", type=float, default=1e-6,
-                        help='learning rate')
+    parser.add_argument("--tv-loss-weight", type=float, default=0.0,
+                        help='weight for Total Variation loss')
     parser.add_argument("--use-uncertainties", action='store_true', 
                         help='use gaussian observation loss with uncertainty')
     parser.add_argument("--big", action='store_true', 
@@ -1085,6 +1121,12 @@ def config_parser():
                         help='Joao idea: weight loss with diff between GT and BG')
     parser.add_argument("--bg-guided-sparsity", action='store_true', 
                         help='BG guided sparsity constraint on FG sigmas')
+    parser.add_argument("--push-pull-weight", type=float, default=0.0,
+                        help='weight for Push-Pull loss on time embeddings')
+    parser.add_argument("--on-off-encoding", action='store_true',
+                        help='Use OnOffEncoding for time')
+    parser.add_argument("--piecewise-constant", action='store_true',
+                        help="Use piecewise constant for time")
 
     ### The following didn't work:
     # parser.add_argument("--entropy-color", action='store_true', 
@@ -1147,15 +1189,21 @@ def train():
     basedir = args.basedir
     args.expname += "_fine"+str(args.finest_res) + "_log2T"+str(args.log2_hashmap_size)
     args.expname += "_lr"+str(args.lrate) + "_decay"+str(args.lrate_decay)
-    if not args.xyzt_model:
-        args.expname += "_NeuralDiffsig_CoarseAdapt"
-    else:
+    if args.xyzt_model:
         args.expname += "_BGFG_XYZT"
         if args.use_actor_xyzt:
             args.expname += "withAct"
         args.expname += "_lev"+str(args.xyzt_embed_levels)
+    elif args.on_off_encoding:
+        args.expname += "_BGFG_OnOff"
+    elif args.piecewise_constant:
+        args.expname += "_BGFG_PieceCon"
+    else:
+        args.expname += "_NeuralDiffsig_CoarseAdapt"
     if args.fixed_adaptive_loss:
         args.expname += "_Fixed"
+    else:
+        args.expname += "_L2"
     if args.use_uncertainties:
         args.expname += "_withUncert"
     if args.big:
@@ -1187,6 +1235,8 @@ def train():
         args.expname += "_BGguided"
     if args.bg_guided_sparsity:
         args.expname += "_BGSparsityHSVallch"
+    if args.push_pull_weight>0:
+        args.expname += "_PP" + str(args.push_pull_weight)
     expname = args.expname   
 
     os.makedirs(os.path.join(basedir, expname), exist_ok=True)
@@ -1380,9 +1430,8 @@ def train():
             if args.fixed_adaptive_loss:
                 img_loss0 = lossfun(extras['rgb0']-target_s, alpha=torch.Tensor([-2.]), scale=torch.Tensor([0.01])).sum(dim=-1).mean()
             else:
-                img_loss0 = adaptive_loss.lossfun(extras['rgb0']-target_s).sum(dim=-1).mean()
-            # else:
-            #     img_loss0 = img2mse_with_uncertainty(extras['rgb0'], target_s, extras['uncertainty_map0'].unsqueeze(-1))
+                # img_loss0 = adaptive_loss.lossfun(extras['rgb0']-target_s).sum(dim=-1).mean()
+                img_loss0 = img2mse(extras['rgb0'], target_s)
             loss = loss + img_loss0
             psnr0 = mse2psnr(img_loss0)
 
@@ -1412,10 +1461,7 @@ def train():
                 for embed in ['world_grid_embed', 'camera_grid_embed', 'world_grid_embed_FG']:
                     if render_kwargs_train['embedders'][embed] is None:
                         continue
-                    n_levels = render_kwargs_train['embedders'][embed].n_levels
-                    min_res = render_kwargs_train['embedders'][embed].base_resolution
-                    max_res = render_kwargs_train['embedders'][embed].finest_resolution
-                    log2_hashmap_size = render_kwargs_train['embedders'][embed].log2_hashmap_size
+                    n_levels, min_res, max_res, log2_hashmap_size = render_kwargs_train['embedders'][embed].n_levels, render_kwargs_train['embedders'][embed].base_resolution, render_kwargs_train['embedders'][embed].finest_resolution, render_kwargs_train['embedders'][embed].log2_hashmap_size
 
                     if args.xyzt_model and embed in ['camera_grid_embed', 'world_grid_embed_FG']:
                         tv_loss_fn = total_variation_loss_4D
@@ -1431,10 +1477,7 @@ def train():
                 ### TV loss on time
                 if render_kwargs_train['embedders']['time_grid_embed'] is not None:
                     embed = 'time_grid_embed'
-                    n_levels = render_kwargs_train['embedders'][embed].n_levels
-                    min_res = render_kwargs_train['embedders'][embed].base_resolution
-                    max_res = render_kwargs_train['embedders'][embed].finest_resolution
-                    log2_hashmap_size = render_kwargs_train['embedders'][embed].log2_hashmap_size
+                    n_levels, min_res, max_res, log2_hashmap_size = render_kwargs_train['embedders'][embed].n_levels, render_kwargs_train['embedders'][embed].base_resolution, render_kwargs_train['embedders'][embed].finest_resolution, render_kwargs_train['embedders'][embed].log2_hashmap_size
                     TV_loss += sum(total_variation_loss_1D(render_kwargs_train['embedders'][embed].embeddings[i], \
                                                     min_res, max_res, \
                                                     i, log2_hashmap_size, \
@@ -1442,11 +1485,23 @@ def train():
                                                     scaled=args.scaled_tvloss) for i in range(n_levels))
 
                 loss = loss + args.tv_loss_weight * TV_loss
-                # if i>1000:
-                #     args.tv_loss_weight = 0.0
+
+        # add Push Pull clustering loss on time embeddings
+        if args.push_pull_weight>0:
+            push_pull = 0.0
+            if args.xyzt_model:
+                for embed in ['camera_grid_embed', 'world_grid_embed_FG']:
+                    if render_kwargs_train['embedders'][embed] is None:
+                        continue
+                    n_levels, min_res, max_res, log2_hashmap_size = render_kwargs_train['embedders'][embed].n_levels, render_kwargs_train['embedders'][embed].base_resolution, render_kwargs_train['embedders'][embed].finest_resolution, render_kwargs_train['embedders'][embed].log2_hashmap_size
+                    push_pull += sum(push_pull_loss_xyzt(render_kwargs_train['embedders'][embed].embeddings[i], \
+                                                        min_res, max_res, \
+                                                        i, log2_hashmap_size, \
+                                                        n_levels=n_levels) for i in range(n_levels))
+
+            loss = loss + args.push_pull_weight * push_pull
  
         loss.backward()
-        # pdb.set_trace()
         optimizer.step()
 
         # NOTE: IMPORTANT!

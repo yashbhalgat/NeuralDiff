@@ -1,4 +1,7 @@
+from itertools import combinations, chain, product
+from random import sample
 from math import exp, log, floor
+from this import d
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -84,13 +87,6 @@ def total_variation_loss_1D(embeddings, min_resolution, max_resolution, level, l
     b = exp((log(max_resolution)-log(min_resolution))/(n_levels-1))
     resolution = torch.tensor(floor(min_resolution * b**level))
 
-    # # Cube size to apply TV loss
-    # min_bin_size = min_resolution - 1
-    # max_bin_size = 50 # can be tuned
-    # if min_bin_size > max_bin_size:
-    #     print("ALERT! min cuboid size greater than max!")
-    #     pdb.set_trace()
-    # bin_size = torch.floor(torch.clip(resolution/10.0, min_bin_size, max_bin_size)).int()
     bin_size = resolution - 1
 
     # Sample bin
@@ -111,6 +107,43 @@ def total_variation_loss_1D(embeddings, min_resolution, max_resolution, level, l
     else:
         return tv_loss 
 
+
+def push_pull_loss_xyzt(embeddings, min_resolution, max_resolution, level, log2_hashmap_size, n_levels=16):
+    # Get resolution
+    b = exp((log(max_resolution)-log(min_resolution))/(n_levels-1))
+    
+    resolution = torch.tensor(floor(min_resolution * b**level))
+    grid_size = 1.0/resolution    # upto a scaling factor
+
+    N = 100
+    # sample N unique pairs --> time (t_i, t_j)
+    pairs = sample(list(combinations(range(resolution),2)), N)
+    t_0 = torch.tensor([p[0] for p in pairs])
+    t_1 = torch.tensor([p[1] for p in pairs])
+
+    # generate random xyz cuboid of size 30
+    min_vertex = torch.randint(0, resolution-30, (3,))
+    idx = min_vertex + torch.stack([torch.arange(30+1) for _ in range(3)], dim=-1)
+
+    # cartesian product of xyz and t
+    xyzt_0 = torch.stack(torch.meshgrid(idx[:,0], idx[:,1], idx[:,2], t_0), dim=-1)
+    xyzt_1 = torch.stack(torch.meshgrid(idx[:,0], idx[:,1], idx[:,2], t_1), dim=-1)
+
+    # get embeddings
+    hashed_indices_0 = hash(xyzt_0, log2_hashmap_size)
+    hashed_indices_1 = hash(xyzt_1, log2_hashmap_size)
+    embeddings_0 = embeddings(hashed_indices_0)
+    embeddings_1 = embeddings(hashed_indices_1)
+
+    # Get Pull and Push loss
+    std = 10.0/min_resolution
+    std_dist = 0.0001
+    dist_sq = torch.pow((t_0-t_1)*grid_size, 2) / std**2
+    embed_dist_sq = torch.sum((embeddings_0-embeddings_1)**2, dim=-1) / std_dist**2
+    pull = torch.exp(-dist_sq) * embed_dist_sq.mean(dim=(0,1,2))
+    push = dist_sq * torch.exp(-embed_dist_sq).mean(dim=(0,1,2))
+
+    return pull.mean() + push.mean()
 
 class BGguidedLoss(nn.Module):
     def __init__(self):
