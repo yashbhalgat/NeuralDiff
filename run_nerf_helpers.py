@@ -913,7 +913,9 @@ class BGFG_PiecewiseConst(nn.Module):
                  input_ch_views=3, input_ch_views_cam=3,
                  use_uncertainties=False,
                  static_grid=None,
-                 coarse=True):
+                 coarse=True,
+                 init_temperature=100.0,
+                 n_pieces=10):
         super(BGFG_PiecewiseConst, self).__init__()
 
         self.input_ch, self.input_cam_ch = input_ch, input_cam_ch # it's raw xyzt, so input_ch=4
@@ -927,7 +929,9 @@ class BGFG_PiecewiseConst(nn.Module):
         
         self.static_grid = static_grid
         if not coarse: # if this is a "fine" model, use dynamic components
-            self.FG_xyzt_encoder = XYZ_TimePiecewiseConstant(xyzt_bounds=xyzt_bounds)
+            self.FG_xyzt_encoder = XYZ_TimePiecewiseConstant(xyzt_bounds=xyzt_bounds,
+                                                             init_temperature=init_temperature,
+                                                             n_pieces=n_pieces)
             
         ### Background Network
         self.BG_sigma_net, self.BG_color_net = create_sigma_and_color_MLP(num_layers, num_layers_color,

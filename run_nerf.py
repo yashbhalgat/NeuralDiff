@@ -569,7 +569,9 @@ def create_nerf(args):
                                             input_ch_views=input_ch_views, input_ch_views_cam=input_ch_views,
                                             use_uncertainties=args.use_uncertainties,
                                             static_grid=world_grid_embed,
-                                            coarse=False).to(device)
+                                            coarse=False,
+                                            init_temperature=args.init_temp,
+                                            n_pieces=args.n_pieces).to(device)
         else:
             model_fine = model_class(num_layers=2,
                             hidden_dim=64,
@@ -637,7 +639,7 @@ def create_nerf(args):
     if args.ft_path is not None and args.ft_path!='None':
         ckpts = [args.ft_path]
     else:
-        ckpts = [os.path.join(basedir, expname, f) for f in sorted(os.listdir(os.path.join(basedir, expname))) if 'tar' in f]
+        ckpts = [os.path.join(args.ckptdir, expname, f) for f in sorted(os.listdir(os.path.join(args.ckptdir, expname))) if 'tar' in f]
 
     print('Found ckpts', ckpts)
     if len(ckpts) > 0 and not args.no_reload:
@@ -977,6 +979,8 @@ def config_parser():
                         help='experiment name')
     parser.add_argument("--basedir", type=str, default='./logs/', 
                         help='where to store ckpts and logs')
+    parser.add_argument("--ckptdir", type=str, default='/work/yashsb/NeuralDiff/logs/', 
+                        help='where to store ckpts and logs')
     parser.add_argument("--datadir", type=str, default='./data/llff/fern', 
                         help='input data directory')
 
@@ -1127,6 +1131,12 @@ def config_parser():
                         help='Use OnOffEncoding for time')
     parser.add_argument("--piecewise-constant", action='store_true',
                         help="Use piecewise constant for time")
+    parser.add_argument("--init-temp", type=float, default=100.0,
+                        help='Temperature for piecewise constant embedding')
+    parser.add_argument("--temperature-decay", type=float, default=0.001,
+                        help='Temperature decay for piecewise constant embedding')
+    parser.add_argument("--n-pieces", type=int, default=10, 
+                        help='number of pieces in PiecewiseConstant Time encoding')
 
     ### The following didn't work:
     # parser.add_argument("--entropy-color", action='store_true', 
@@ -1197,7 +1207,8 @@ def train():
     elif args.on_off_encoding:
         args.expname += "_BGFG_OnOff"
     elif args.piecewise_constant:
-        args.expname += "_BGFG_PieceCon"
+        args.expname += "_BGFG_PConGRU"
+        args.expname += "_T"+str(args.init_temp) + "_Dec"+str(args.temperature_decay) + "_nP"+str(args.n_pieces)
     else:
         args.expname += "_NeuralDiffsig_CoarseAdapt"
     if args.fixed_adaptive_loss:
@@ -1240,6 +1251,7 @@ def train():
     expname = args.expname   
 
     os.makedirs(os.path.join(basedir, expname), exist_ok=True)
+    os.makedirs(os.path.join(args.ckptdir, expname), exist_ok=True)
     f = os.path.join(basedir, expname, 'args.txt')
     with open(f, 'w') as file:
         for arg in sorted(vars(args)):
@@ -1513,13 +1525,17 @@ def train():
             param_group['lr'] = new_lrate
         ################################
 
+        # update temperature of PiecewiseConstant embeddings
+        if args.piecewise_constant:
+            render_kwargs_train['network_fine'].FG_xyzt_encoder.temperature *= args.temperature_decay**(1.0 / decay_steps)
+
         t = time.time()-time0
         # print(f"Step: {global_step}, Loss: {loss}, Time: {dt}")
         #####           end            #####
 
         # Rest is logging
         if i%args.i_weights==0:
-            path = os.path.join(basedir, expname, '{:06d}.tar'.format(i))
+            path = os.path.join(args.ckptdir, expname, '{:06d}.tar'.format(i))
             if args.i_embed==1:
                 torch.save({
                     'global_step': global_step,
