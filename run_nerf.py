@@ -409,9 +409,9 @@ def create_nerf(args):
     """Instantiate NeRF's MLP model.
     """
     embed_fn, input_ch, time_dim = get_embedder(args.multires, args, i=args.i_embed)
-    if args.i_embed==1:
-        # hashed embedding table
-        embedding_params = list(embed_fn.parameters())
+    # if args.i_embed==1:
+        # commenting for now
+        # embedding_params = list(embed_fn.parameters())
 
     input_ch_views = 0
     embeddirs_fn = None
@@ -452,7 +452,7 @@ def create_nerf(args):
         if args.use_actor_xyzt:
             camera_grid_embed = HashEmbedder(bounding_box=args.bounding_box_incameraframe, \
                             n_levels=args.xyzt_embed_levels, \
-                            n_features_per_level=2, \
+                            n_features_per_level=4 if args.big_world_embed else 2, \
                             base_resolution=128,
                             log2_hashmap_size=args.log2_hashmap_size, \
                             finest_resolution=args.finest_res*4)
@@ -615,6 +615,19 @@ def create_nerf(args):
     else:
         BGguided_sparsity = None
 
+    if args.push_pull_weight>0 and args.xyzt_model:
+        Push_Pull_loss = PushPullLoss(xyz_bounding_box=xyz_bounding_box, 
+                                base_res=world_grid_embed_FG.base_resolution, 
+                                finest_res=world_grid_embed_FG.finest_resolution, 
+                                log2_hashmap_size=world_grid_embed_FG.log2_hashmap_size, 
+                                n_levels=world_grid_embed_FG.n_levels,
+                                n_features_per_level=world_grid_embed_FG.n_features_per_level, 
+                                n_centroids=20)
+        grad_vars += list(Push_Pull_loss.parameters())
+    else:
+        Push_Pull_loss = None
+
+
     # Create optimizer
     if args.i_embed==1:
         # sparse_opt = torch.optim.SparseAdam(embedding_params, lr=args.lrate, betas=(0.9, 0.99), eps=1e-15)
@@ -694,7 +707,7 @@ def create_nerf(args):
     render_kwargs_test['raw_noise_std'] = 0.
     render_kwargs_test['test_time'] = True # if "test_time" in render_kwargs_test, then you are in testing mode
 
-    return render_kwargs_train, render_kwargs_test, start, adaptive_loss, BGguided_loss, BGguided_sparsity, optimizer
+    return render_kwargs_train, render_kwargs_test, start, adaptive_loss, BGguided_loss, BGguided_sparsity, Push_Pull_loss, optimizer
 
 
 def get_weights_from_sigmas(sigmas, dists, noise=0.0):
@@ -1125,8 +1138,6 @@ def config_parser():
                         help='Joao idea: weight loss with diff between GT and BG')
     parser.add_argument("--bg-guided-sparsity", action='store_true', 
                         help='BG guided sparsity constraint on FG sigmas')
-    parser.add_argument("--push-pull-weight", type=float, default=0.0,
-                        help='weight for Push-Pull loss on time embeddings')
     parser.add_argument("--on-off-encoding", action='store_true',
                         help='Use OnOffEncoding for time')
     parser.add_argument("--piecewise-constant", action='store_true',
@@ -1137,6 +1148,8 @@ def config_parser():
                         help='Temperature decay for piecewise constant embedding')
     parser.add_argument("--n-pieces", type=int, default=10, 
                         help='number of pieces in PiecewiseConstant Time encoding')
+    parser.add_argument("--push-pull-weight", type=float, default=0.0,
+                        help='weight for Push-Pull loss with centroids')
 
     ### The following didn't work:
     # parser.add_argument("--entropy-color", action='store_true', 
@@ -1247,7 +1260,7 @@ def train():
     if args.bg_guided_sparsity:
         args.expname += "_BGSparsityHSVallch"
     if args.push_pull_weight>0:
-        args.expname += "_PP" + str(args.push_pull_weight)
+        args.expname += "_PP" + str(args.push_pull_weight) + "cent20"
     expname = args.expname   
 
     os.makedirs(os.path.join(basedir, expname), exist_ok=True)
@@ -1263,7 +1276,7 @@ def train():
             file.write(open(args.config, 'r').read())
 
     # Create nerf model
-    render_kwargs_train, render_kwargs_test, start, adaptive_loss, BGguided_loss, BGguided_sparsity, optimizer = create_nerf(args)
+    render_kwargs_train, render_kwargs_test, start, adaptive_loss, BGguided_loss, BGguided_sparsity, Push_Pull_loss, optimizer = create_nerf(args)
     global_step = start
 
     bds_dict = {
@@ -1352,7 +1365,6 @@ def train():
     poses = torch.Tensor(poses).to(device)
     if use_batching:
         rays_rgb = torch.Tensor(rays_rgb).to(device)
-
 
     N_iters = int(50000 * 1024/args.N_rand) + 1
     args.lrate = args.lrate * math.sqrt(args.N_rand/1024.0)
@@ -1500,20 +1512,21 @@ def train():
 
         # add Push Pull clustering loss on time embeddings
         if args.push_pull_weight>0:
-            push_pull = 0.0
-            if args.xyzt_model:
-                for embed in ['camera_grid_embed', 'world_grid_embed_FG']:
-                    if render_kwargs_train['embedders'][embed] is None:
-                        continue
-                    n_levels, min_res, max_res, log2_hashmap_size = render_kwargs_train['embedders'][embed].n_levels, render_kwargs_train['embedders'][embed].base_resolution, render_kwargs_train['embedders'][embed].finest_resolution, render_kwargs_train['embedders'][embed].log2_hashmap_size
-                    push_pull += sum(push_pull_loss_xyzt(render_kwargs_train['embedders'][embed].embeddings[i], \
-                                                        min_res, max_res, \
-                                                        i, log2_hashmap_size, \
-                                                        n_levels=n_levels) for i in range(n_levels))
-
+            # push_pull = 0.0
+            # if args.xyzt_model:
+            #     for embed in ['camera_grid_embed', 'world_grid_embed_FG']:
+            #         if render_kwargs_train['embedders'][embed] is None:
+            #             continue
+            #         n_levels, min_res, max_res, log2_hashmap_size = render_kwargs_train['embedders'][embed].n_levels, render_kwargs_train['embedders'][embed].base_resolution, render_kwargs_train['embedders'][embed].finest_resolution, render_kwargs_train['embedders'][embed].log2_hashmap_size
+            #         push_pull += sum(push_pull_loss_xyzt(render_kwargs_train['embedders'][embed].embeddings[i], \
+            #                                             min_res, max_res, \
+            #                                             i, log2_hashmap_size, \
+            #                                             n_levels=n_levels) for i in range(n_levels))
+            push_pull = Push_Pull_loss(render_kwargs_train['embedders']['world_grid_embed_FG'])
             loss = loss + args.push_pull_weight * push_pull
  
         loss.backward()
+        # pdb.set_trace()
         optimizer.step()
 
         # NOTE: IMPORTANT!

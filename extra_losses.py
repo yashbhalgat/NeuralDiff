@@ -9,6 +9,7 @@ from skimage.color import rgb2hsv
 import pdb
 
 from hash_utils import hash
+from hash_encoding import HashEmbedder
 
 from run_nerf_helpers import img2mse_with_uncertainty_perray, img2mse, img2mse_perray
 
@@ -144,6 +145,72 @@ def push_pull_loss_xyzt(embeddings, min_resolution, max_resolution, level, log2_
     push = dist_sq * torch.exp(-embed_dist_sq).mean(dim=(0,1,2))
 
     return pull.mean() + push.mean()
+
+
+class PushPullLoss(nn.Module):
+    def __init__(self, xyz_bounding_box, base_res, finest_res, log2_hashmap_size, n_levels=16, n_features_per_level=4, n_centroids=10):
+        super(PushPullLoss, self).__init__()
+        self.xyz_bounding_box = xyz_bounding_box
+        self.base_res = base_res
+        self.finest_res = finest_res
+        self.log2_hashmap_size = log2_hashmap_size - 3 # less 3 for 1/8th size because we have ~10 embedders
+        self.n_levels = n_levels
+        self.n_features_per_level = n_features_per_level
+        self.b = exp((log(finest_res)-log(base_res))/(n_levels-1))
+        self.n_centroids = n_centroids
+        self.centroid_embedders = nn.ModuleList([
+            HashEmbedder(bounding_box=self.xyz_bounding_box,
+                         base_resolution=base_res,
+                         finest_resolution=finest_res,
+                         n_levels=n_levels,
+                         n_features_per_level=n_features_per_level,
+                         log2_hashmap_size=self.log2_hashmap_size) 
+            for _ in range(n_centroids)
+        ])
+
+    def _cdist_squared(self, x, y):
+        # x: L x L x L x N x D
+        # y: L x L x L x M x D
+        # return: L x L x L x N x M
+        x_norm = (x**2).sum(dim=-1, keepdim=True)
+        y_norm = (y**2).sum(dim=-1, keepdim=True).transpose(-1,-2)
+        return x_norm + y_norm - 2*torch.matmul(x, y.transpose(-1,-2))
+
+    def forward(self, xyzt_embedder):
+        total_push, total_pull = 0.0, 0.0
+        for level in range(self.n_levels):
+            resolution = torch.tensor(floor(self.base_res * self.b**level))
+            # generate random xyz cuboid
+            cube_size = floor(torch.clip(resolution/100, 20, 30))
+            min_vertex = torch.randint(0, resolution-cube_size, (3,))
+            idx = min_vertex + torch.stack([torch.arange(cube_size+1) for _ in range(3)], dim=-1)
+            
+            # sample cube_size number of time points
+            t = torch.tensor(sample(list(range(resolution)), int(cube_size*1.5)))
+            xyzt = torch.stack(torch.meshgrid(idx[:,0], idx[:,1], idx[:,2], t), dim=-1) # N x N x N x 100 x 4coords
+            hashed_xyzt = hash(xyzt, xyzt_embedder.log2_hashmap_size) # N x N x N x 100
+            xyzt_embeddings = xyzt_embedder.embeddings[level](hashed_xyzt) # N x N x N x 100 x 2
+        
+            # get centroid embeddings
+            xyz = torch.stack(torch.meshgrid(idx[:,0], idx[:,1], idx[:,2]), dim=-1) # N x N x N x 3coords
+            hashed_xyz = hash(xyz, self.log2_hashmap_size) # N x N x N
+            centroids = torch.stack([self.centroid_embedders[i].embeddings[level](hashed_xyz) for i in range(self.n_centroids)], dim=-2) # N x N x N x 10 x 2
+
+            # compute soft assignment
+            dists_from_centroids = self._cdist_squared(xyzt_embeddings, centroids) # N x N x N x 100 x 10
+            soft_assignment = torch.exp(-dists_from_centroids/(2*0.0001**2)) # N x N x N x 100 x 10
+            soft_assignment = soft_assignment / (soft_assignment.sum(dim=-1, keepdim=True)+1e-10) # N x N x N x 100 x 10
+            soft_centroids = soft_assignment @ centroids # N x N x N x 100 x 2
+
+            # compute push and pull loss
+            total_pull += ((xyzt_embeddings-soft_centroids)/1.0).pow(2).sum(dim=-1).mean()
+            # torch.cdist(soft_centroids, soft_centroids) --> N x N x N x 10 x 10
+            # total_push += torch.exp(-torch.cdist(soft_centroids, soft_centroids, p=2).pow(2)/(2*1.0**2)).mean()
+            total_push += (1/(1e-15+torch.cdist(soft_centroids, soft_centroids, p=2).pow(2)/(2*1.0**2))).mean()
+
+        print("Push: {}, Pull: {}".format(total_push, total_pull))
+        return total_push + total_pull
+
 
 class BGguidedLoss(nn.Module):
     def __init__(self):
