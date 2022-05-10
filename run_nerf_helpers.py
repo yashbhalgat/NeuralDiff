@@ -4,6 +4,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import pdb
+from skimage.metrics import structural_similarity, peak_signal_noise_ratio
+from lpips import LPIPS
 
 from hash_encoding import HashEmbedder, SHEncoder, XYZplusT_HashEmbedder
 from time_encoding import XYZ_TimeOnOff_Encoding, XYZ_TimePiecewiseConstant
@@ -19,6 +21,34 @@ mse2psnr = lambda x : -10. * torch.log(x) / torch.log(torch.Tensor([10.]))
 to8b = lambda x : (255*np.clip(x,0,1)).astype(np.uint8)
 relu_act = nn.Softplus()
 bce_loss = nn.BCELoss()
+
+lpips_vgg = None
+
+@torch.no_grad()
+def get_perceptual_metrics(rgbs, gts, lpips_batch_size=8, device='cuda'):
+    # rgbs and gts should be numpy arrays of the same shape. Can be just 1 x H x W x 3
+    # From pixelNeRF https://github.com/sxyu/pixel-nerf/blob/2929708e90b246dbd0329ce2a128ef381bd8c25d/eval/calc_metrics.py#L188
+    global lpips_vgg
+    ssim = [structural_similarity(rgb, gt, multichannel=True, data_range=1) for rgb, gt in zip(rgbs, gts)]
+    ssim = np.mean(ssim)
+    psnr = [peak_signal_noise_ratio(rgb, gt, data_range=1) for rgb, gt in zip(rgbs, gts)]
+    psnr = np.mean(psnr)
+
+    # From pixelNeRF https://github.com/sxyu/pixel-nerf/blob/2929708e90b246dbd0329ce2a128ef381bd8c25d/eval/calc_metrics.py#L238
+    if lpips_vgg is None:
+        lpips_vgg = LPIPS(net="vgg").to(device=device)
+    lpips_all = []
+    preds_spl = torch.split(torch.from_numpy(rgbs).unsqueeze(0).permute(0,3,1,2).float(), lpips_batch_size, dim=0)
+    gts_spl = torch.split(torch.from_numpy(gts).unsqueeze(0).permute(0,3,1,2).float(), lpips_batch_size, dim=0)
+    for predi, gti in zip(preds_spl, gts_spl):
+        lpips_i = lpips_vgg(predi.to(device=device), gti.to(device=device))
+        lpips_all.append(lpips_i)
+    lpips = torch.cat(lpips_all)
+    lpips = lpips.mean().item()
+
+    return psnr, ssim, lpips
+
+
 
 # Positional encoding (section 5.1)
 class Embedder:
@@ -986,6 +1016,119 @@ class BGFG_PiecewiseConst(nn.Module):
                                 embedded_xyzt], -1) # 14:
         else:
             return torch.cat([color, sigma.unsqueeze(dim=-1)], -1)
+
+
+class BGFG_XYZT_Bottleneck(nn.Module):
+    '''
+    XYZT grid for foreground model 
+    Foreground model also uses some information (encoding) from the BG model, which helps in triangulation
+    '''
+    def __init__(self,
+                 num_layers=2,
+                 hidden_dim=64,
+                 geo_feat_dim=15,
+                 num_layers_color=2,
+                 num_layers_FG=4,
+                 input_ch=4, input_cam_ch=4,
+                 input_ch_views=3, input_ch_views_cam=3,
+                 use_uncertainties=False,
+                 static_grid=None, xyzt_grid=None,
+                 coarse=True):
+        super(BGFG_XYZT_Bottleneck, self).__init__()
+
+        self.input_ch, self.input_cam_ch = input_ch, input_cam_ch # it's raw xyzt, so input_ch=4
+        self.input_ch_views, self.input_ch_views_cam = input_ch_views, input_ch_views_cam # has embedded views
+
+        self.num_layers, self.num_layers_color, self.hidden_dim = num_layers, num_layers_color, hidden_dim
+        
+        self.geo_feat_dim = geo_feat_dim
+        self.num_layers_FG = num_layers_FG
+        if coarse:
+            self.use_uncertainties = False
+        else:
+            self.use_uncertainties = use_uncertainties
+        self.coarse = coarse # Is this a coarse model?
+        
+        self.static_grid = static_grid
+        if not coarse: # if this is a "fine" model, use dynamic components
+            self.xyzt_grid = xyzt_grid # separate high freq grid for FG
+            
+        ### Static components
+        self.xyz_encoder = nn.Sequential(
+            nn.Linear(static_grid.out_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU()
+        )
+        self.BG_sigma_net = nn.Sequential(
+            nn.Linear(hidden_dim, 1),
+            nn.Softplus()
+        )
+        self.xyz_final_encoder = nn.Linear(hidden_dim, geo_feat_dim)
+        self.BG_color_net = nn.Sequential(
+            nn.Linear(geo_feat_dim + input_ch_views, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 3),
+            nn.Sigmoid()
+        )
+
+        ### Dynamic components
+        if not coarse:  
+            self.FG_encoder = nn.Sequential(
+                nn.Linear(xyzt_grid.out_dim + geo_feat_dim, hidden_dim//2),
+                nn.ReLU(),
+                nn.Linear(hidden_dim//2, hidden_dim//2),
+                nn.ReLU(),
+                nn.Linear(hidden_dim//2, hidden_dim//2),
+                nn.ReLU(),
+                nn.Linear(hidden_dim//2, hidden_dim//2),
+                nn.ReLU()
+            )
+            self.FG_sigma_net = nn.Sequential(nn.Linear(hidden_dim//2, 1), nn.Softplus())
+            self.FG_color_net = nn.Sequential(nn.Linear(hidden_dim//2, 3), nn.Sigmoid())
+            self.FG_uncertainty_net = nn.Sequential(nn.Linear(hidden_dim//2, 1), nn.Softplus())
+
+    def forward(self, x):
+        input_pts, input_pts_cam, input_views, input_views_cam = torch.split(x, [self.input_ch, self.input_cam_ch, self.input_ch_views, self.input_ch_views_cam], dim=-1)
+        embedded_xyz, keep_mask = self.static_grid(input_pts[...,:3])
+        if not self.coarse:
+            embedded_xyzt, keep_mask_FG = self.xyzt_grid(input_pts)
+            
+        ### Static components
+        xyz_encoding = self.xyz_encoder(embedded_xyz)
+        BG_sigma = self.BG_sigma_net(xyz_encoding)
+
+        xyz_encoding_final = self.xyz_final_encoder(xyz_encoding) # size: (B, geo_feat_dim)
+
+        BG_color = self.BG_color_net(torch.cat([xyz_encoding_final, input_views], dim=-1))
+        BG_sigma, BG_color = BG_sigma*keep_mask[:,None], BG_color*keep_mask[:,None]
+
+        ### Dynamic components
+        if not self.coarse:
+            FG_encoding = self.FG_encoder(torch.cat([embedded_xyzt, xyz_encoding_final], dim=-1)) # size: (B, hidden_dim//2)
+            FG_sigma = self.FG_sigma_net(FG_encoding)
+            FG_color = self.FG_color_net(FG_encoding)
+            FG_uncertainties = self.FG_uncertainty_net(FG_encoding)
+            FG_sigma, FG_color = FG_sigma*keep_mask_FG[:,None], FG_color*keep_mask_FG[:,None]
+
+            ### we don't have actor, but doing this to make the code consistent
+            ACTOR_sigma, ACTOR_color, ACTOR_uncertainties = torch.zeros_like(BG_sigma), torch.zeros_like(BG_color), torch.zeros_like(FG_uncertainties)
+            ##################
+        else:
+            FG_sigma, FG_color, FG_uncertainties = torch.zeros_like(BG_sigma), torch.zeros_like(BG_color), None
+            ACTOR_sigma, ACTOR_color, ACTOR_uncertainties = torch.zeros_like(BG_sigma), torch.zeros_like(BG_color), None
+
+        # Principled color mixing
+        sigma = BG_sigma + FG_sigma + ACTOR_sigma + 1e-9
+        color = (BG_sigma/sigma) * BG_color + (FG_sigma/sigma) * FG_color + (ACTOR_sigma/sigma) * ACTOR_color
+
+        if self.use_uncertainties:
+            return torch.cat([BG_color, FG_color, ACTOR_color, # :3, 3:6, 6:9
+                                BG_sigma, FG_sigma, ACTOR_sigma, # 9, 10, 11
+                                FG_uncertainties, ACTOR_uncertainties, # 12, 13
+                                FG_encoding], -1) # 14:
+        else:
+            return torch.cat([color, sigma], -1)
 
 
 # Ray helpers

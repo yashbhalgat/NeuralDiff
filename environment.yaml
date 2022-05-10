@@ -5,9 +5,9 @@ channels:
   - anaconda
   - defaults
 dependencies:
-  - pip=21.0.1=py37h06a4308_0
-  - matplotlib-base=3.3.3=py37h4f6019d_0
-  - ffmpeg=4.2.2=h20bf706_0
+  - pip=21.0.1
+  - matplotlib-base=3.3.3
+  - ffmpeg=4.2.2
   - pip:
     - numpy==1.20.1
     - pytorch-lightning==1.1.5

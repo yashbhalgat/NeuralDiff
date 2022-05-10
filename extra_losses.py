@@ -270,3 +270,19 @@ class BGguidedSparsityWeights(nn.Module):
         weights = torch.exp(-3.*(diff-threshold)) # lower the diff, higher the sparsity constraint
 
         return weights
+
+
+def BGFG_ordering_loss(BG_weights, FG_weights):
+    '''
+    To enforce that BG peak occurs after FG peak
+    BG_weights: N x M
+    FG_weights: N x M
+    '''
+    BG_cumsum = torch.cumsum(BG_weights, dim=-1)
+    FG_cumsum = torch.cumsum(FG_weights, dim=-1)
+    diff = FG_cumsum - BG_cumsum # N x M
+    diffsum_along_ray = diff.sum(dim=-1) # N 
+    # if diffsum is positive, then leave it. If it's negative, maximize it
+    margin = 0.01
+    loss = F.relu(-diffsum_along_ray+margin)
+    return loss # size: N
