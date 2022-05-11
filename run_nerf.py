@@ -457,9 +457,9 @@ def create_nerf(args):
         world_grid_embed_FG = HashEmbedder(bounding_box=args.bounding_box, \
                                 n_levels=args.xyzt_embed_levels, \
                                 n_features_per_level=4 if args.big_world_embed else 2, \
-                                base_resolution=128,
+                                base_resolution=[128,128,128,16],
                                 log2_hashmap_size=args.log2_hashmap_size, \
-                                finest_resolution=args.finest_res*4)
+                                finest_resolution=[args.finest_res,args.finest_res,args.finest_res,1024])
 
     camera_grid_embed, time_grid_embed = None, None
     if args.xyzt_model:

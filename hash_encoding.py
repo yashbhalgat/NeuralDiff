@@ -15,11 +15,22 @@ class HashEmbedder(nn.Module):
         self.n_levels = n_levels
         self.n_features_per_level = n_features_per_level
         self.log2_hashmap_size = log2_hashmap_size
-        self.base_resolution = torch.tensor(base_resolution)
-        self.finest_resolution = torch.tensor(finest_resolution)
+
+        if hasattr(base_resolution, "__len__") and len(base_resolution)>1:
+            # if base_resolution is a list, ...
+            self.base_resolution = torch.tensor(base_resolution)
+        else:
+            # if just one value is given, use it for all 4 (or 3) dimensions
+            self.base_resolution = torch.tensor([base_resolution for _ in range(4)])
+        
+        if hasattr(finest_resolution, "__len__") and len(finest_resolution)>1:
+            self.finest_resolution = torch.tensor(finest_resolution)
+        else:
+            self.finest_resolution = torch.tensor([finest_resolution for _ in range(4)])
+
         self.out_dim = self.n_levels * self.n_features_per_level
 
-        self.b = torch.exp((torch.log(self.finest_resolution.float())-torch.log(self.base_resolution.float()))/(n_levels-1))
+        self.b = torch.exp((torch.log(self.finest_resolution.float())-torch.log(self.base_resolution.float()))/(n_levels-1)) # 4 values
 
         self.embeddings = nn.ModuleList([nn.Embedding(2**self.log2_hashmap_size, \
                                         self.n_features_per_level) for _ in range(n_levels)])
@@ -98,7 +109,7 @@ class HashEmbedder(nn.Module):
             resolution = torch.floor(self.base_resolution * self.b**i)
             voxel_min_vertex, voxel_max_vertex, hashed_voxel_indices, keep_mask = get_voxel_vertices(\
                                                 x, self.bounding_box, \
-                                                resolution, self.log2_hashmap_size)
+                                                resolution[:x.shape[-1]], self.log2_hashmap_size)
             
             voxel_embedds = self.embeddings[i](hashed_voxel_indices)
 

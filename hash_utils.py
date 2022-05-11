@@ -30,7 +30,7 @@ def get_voxel_vertices(xyzt, bounding_box, resolution, log2_hashmap_size):
     '''
     xyz: 3D coordinates of samples. B x 3 or B x 4
     bounding_box: min and max x,y,z coordinates of object bbox
-    resolution: number of voxels per axis
+    resolution: number of voxels per axis. 4 values
     '''
     box_min, box_max = bounding_box
 
