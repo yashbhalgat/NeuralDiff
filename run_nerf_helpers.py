@@ -1026,7 +1026,7 @@ class BGFG_XYZT_Bottleneck(nn.Module):
     def __init__(self,
                  num_layers=2,
                  hidden_dim=64,
-                 geo_feat_dim=15,
+                 geo_feat_dim=24,
                  num_layers_color=2,
                  num_layers_FG=4,
                  input_ch=4, input_cam_ch=4,
@@ -1057,14 +1057,14 @@ class BGFG_XYZT_Bottleneck(nn.Module):
         self.xyz_encoder = nn.Sequential(
             nn.Linear(static_grid.out_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU()
         )
         self.BG_sigma_net = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
             nn.Linear(hidden_dim, 1),
             nn.Softplus()
         )
-        self.xyz_final_encoder = nn.Linear(hidden_dim, geo_feat_dim)
+        self.xyz_final_encoder = nn.Sequential(nn.Linear(hidden_dim, geo_feat_dim), nn.ReLU())
         self.BG_color_net = nn.Sequential(
             nn.Linear(geo_feat_dim + input_ch_views, hidden_dim),
             nn.ReLU(),
@@ -1085,6 +1085,7 @@ class BGFG_XYZT_Bottleneck(nn.Module):
                 nn.ReLU()
             )
             self.FG_sigma_net = nn.Sequential(nn.Linear(hidden_dim//2, 1), nn.Softplus())
+            # self.FG_sigma_net[0].bias.data.fill_(-1.0)
             self.FG_color_net = nn.Sequential(nn.Linear(hidden_dim//2, 3), nn.Sigmoid())
             self.FG_uncertainty_net = nn.Sequential(nn.Linear(hidden_dim//2, 1), nn.Softplus())
 

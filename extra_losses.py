@@ -50,21 +50,27 @@ def total_variation_loss_3D(embeddings, min_resolution, max_resolution, level, l
 
 def total_variation_loss_4D(embeddings, min_resolution, max_resolution, level, log2_hashmap_size, n_levels=16, scaled=False):
     # Get resolution
-    b = exp((log(max_resolution)-log(min_resolution))/(n_levels-1))
-    resolution = torch.tensor(floor(min_resolution * b**level))
+    # b = exp((log(max_resolution)-log(min_resolution))/(n_levels-1))
+    # resolution = torch.tensor(floor(min_resolution * b**level))
+    b = torch.exp((torch.log(max_resolution.float())-torch.log(min_resolution.float()))/(n_levels-1))
+    resolution = torch.floor(min_resolution * b**level).int() # 4 values
 
     # Cube size to apply TV loss
-    min_cube_size = 20
+    min_cube_size = min(20, *min_resolution)-1
     max_cube_size = 50 # can be tuned
     if min_cube_size > max_cube_size:
         print("ALERT! min cuboid size greater than max!")
         pdb.set_trace()
-    cube_size = torch.floor(torch.clip(resolution/100.0, min_cube_size, max_cube_size)).int()
+    cube_size = torch.floor(torch.clip(resolution/100.0, min_cube_size, max_cube_size)).int() # 4 values
 
     # Sample cuboid
-    min_vertex = torch.randint(0, resolution-cube_size, (4,))
-    idx = min_vertex + torch.stack([torch.arange(cube_size+1) for _ in range(4)], dim=-1)
-    cube_indices = torch.stack(torch.meshgrid(idx[:,0], idx[:,1], idx[:,2], idx[:,3]), dim=-1)
+    # min_vertex = torch.randint(0, resolution-cube_size, (4,))
+    min_vertex = torch.cat([torch.randint(0, resolution[0]-cube_size[0], (1,)), torch.randint(0, resolution[1]-cube_size[1], (1,)), torch.randint(0, resolution[2]-cube_size[2], (1,)), torch.randint(0, resolution[3]-cube_size[3], (1,))])
+    idx_list = []
+    for i in range(4):
+        idx_list.append(min_vertex[i] + torch.arange(cube_size[i]+1))
+    # idx = min_vertex + torch.stack([torch.arange(cube_size[i]+1) for i in range(4)], dim=-1)
+    cube_indices = torch.stack(torch.meshgrid(idx_list[0], idx_list[1], idx_list[2], idx_list[3]), dim=-1)
 
     hashed_indices = hash(cube_indices, log2_hashmap_size)
     cube_embeddings = embeddings(hashed_indices)
@@ -74,8 +80,8 @@ def total_variation_loss_4D(embeddings, min_resolution, max_resolution, level, l
     tv_z = torch.pow(cube_embeddings[:,:,1:,:]-cube_embeddings[:,:,:-1,:], 2).sum()
     tv_t = torch.pow(cube_embeddings[:,:,:,1:]-cube_embeddings[:,:,:,:-1], 2).sum()
 
-    tv_loss = (tv_x + tv_y + tv_z + tv_t)/cube_size
-    scaled_tv_loss = tv_loss * log(resolution)
+    tv_loss = (tv_x + tv_y + tv_z + tv_t)/cube_size.prod().pow(0.25)
+    scaled_tv_loss = tv_loss * log(resolution.prod().pow(0.25))
 
     if scaled:
         return scaled_tv_loss

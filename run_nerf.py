@@ -297,6 +297,8 @@ def render_path(render_poses, render_frame_idxs, hwf, K, chunk, render_kwargs, g
     uncertainty_maps = []
     psnrs = []
     mAPs = []
+    ssim_list = []
+    lpips_list = []
     t = time.time()
     for i, c2w in enumerate(tqdm(render_poses)):
         print(i, time.time() - t)
@@ -320,6 +322,8 @@ def render_path(render_poses, render_frame_idxs, hwf, K, chunk, render_kwargs, g
             psnr, ssim, lpips = get_perceptual_metrics(rgb.cpu().numpy(), gt_img, lpips_batch_size=8, device='cuda')
             print("PSNR: ", psnr, "SSIM: ", ssim, "LPIPS: ", lpips)
             psnrs.append(psnr)
+            ssim_list.append(ssim)
+            lpips_list.append(lpips)
 
         if savedir is not None:
             rgb8 = to8b(rgbs[-1])
@@ -413,8 +417,16 @@ def render_path(render_poses, render_frame_idxs, hwf, K, chunk, render_kwargs, g
             pickle.dump(psnrs, fp)
         
         print("Avg mAP over Test set: ", sum(mAPs)/len(mAPs))
-        with open(os.path.join(savedir, "test_mAPs_avg{:0.2f}.pkl".format(sum(mAPs)/len(mAPs))), "wb") as fp:
+        with open(os.path.join(savedir, "test_mAPs_avg{:0.3f}.pkl".format(sum(mAPs)/len(mAPs))), "wb") as fp:
             pickle.dump(mAPs, fp)
+
+        print("Avg LPIPS over Test set: ", sum(lpips_list)/len(lpips_list))
+        with open(os.path.join(savedir, "test_LPIPSs_avg{:0.2f}.pkl".format(sum(lpips_list)/len(lpips_list))), "wb") as fp:
+            pickle.dump(lpips_list, fp)
+        
+        print("Avg SSIM over Test set: ", sum(ssim_list)/len(ssim_list))
+        with open(os.path.join(savedir, "test_SSIMs_avg{:0.2f}.pkl".format(sum(ssim_list)/len(ssim_list))), "wb") as fp:
+            pickle.dump(ssim_list, fp)
 
     return rgbs, depths, uncertainty_maps
 
@@ -442,9 +454,19 @@ def create_nerf(args):
     
     ### DEFINING THE FOUNDATIONAL BLOCKS
     world_grid_embed = HashEmbedder(bounding_box=xyz_bounding_box, \
-                        n_features_per_level=4 if args.big_world_embed else 2, \
+                        n_levels=args.xyzt_embed_levels, \
+                        n_features_per_level=4 if args.big_world_embed else 1, \
+                        log2_hashmap_size=args.log2_hashmap_size, \
+                        finest_resolution=1024) # always 1024 for "coarse" static grid. use fine_res for "fine" static grid
+    if args.coarse_fine_separate:
+        world_grid_embed_fine = HashEmbedder(bounding_box=xyz_bounding_box, \
+                        n_levels=args.xyzt_embed_levels,
+                        n_features_per_level=4 if args.big_world_embed else 1, \
                         log2_hashmap_size=args.log2_hashmap_size, \
                         finest_resolution=args.finest_res)
+    else:
+        world_grid_embed_fine = world_grid_embed
+
     world_grid_embed_FG = None
     if args.bg_fg_separate or args.on_off_encoding:
         # high freq embedding for FG
@@ -456,17 +478,17 @@ def create_nerf(args):
     elif args.xyzt_model:
         world_grid_embed_FG = HashEmbedder(bounding_box=args.bounding_box, \
                                 n_levels=args.xyzt_embed_levels, \
-                                n_features_per_level=4 if args.big_world_embed else 2, \
+                                n_features_per_level=4 if args.big_world_embed else 1, \
                                 base_resolution=[128,128,128,16],
                                 log2_hashmap_size=args.log2_hashmap_size, \
-                                finest_resolution=[args.finest_res,args.finest_res,args.finest_res,1024])
+                                finest_resolution=[args.finest_res*4,args.finest_res*4,args.finest_res*2,1024])
 
     camera_grid_embed, time_grid_embed = None, None
     if args.xyzt_model:
         if args.use_actor_xyzt:
             camera_grid_embed = HashEmbedder(bounding_box=args.bounding_box_incameraframe, \
                             n_levels=args.xyzt_embed_levels, \
-                            n_features_per_level=4 if args.big_world_embed else 2, \
+                            n_features_per_level=4 if args.big_world_embed else 1, \
                             base_resolution=128,
                             log2_hashmap_size=args.log2_hashmap_size, \
                             finest_resolution=args.finest_res*4)
@@ -492,7 +514,7 @@ def create_nerf(args):
         if args.use_xyzt_bottleneck:
             model = BGFG_XYZT_Bottleneck(num_layers=2, # doesn't matter
                             hidden_dim=64,
-                            geo_feat_dim=15,
+                            geo_feat_dim=64,
                             num_layers_color=3, # doesn't matter
                             input_ch=input_ch, input_cam_ch=input_ch,
                             input_ch_views=input_ch_views, input_ch_views_cam=input_ch_views,
@@ -502,7 +524,7 @@ def create_nerf(args):
         else:
             model = BGFG_XYZT(num_layers=2,
                             hidden_dim=64,
-                            geo_feat_dim=15,
+                            geo_feat_dim=64,
                             num_layers_color=3,
                             input_ch=input_ch, input_cam_ch=input_ch,
                             input_ch_views=input_ch_views, input_ch_views_cam=input_ch_views,
@@ -564,22 +586,22 @@ def create_nerf(args):
             if args.use_xyzt_bottleneck:
                 model_fine = BGFG_XYZT_Bottleneck(num_layers=2, # doesn't matter
                                 hidden_dim=64,
-                                geo_feat_dim=15,
+                                geo_feat_dim=64,
                                 num_layers_color=3, # doesn't matter
                                 input_ch=input_ch, input_cam_ch=input_ch,
                                 input_ch_views=input_ch_views, input_ch_views_cam=input_ch_views,
                                 use_uncertainties=args.use_uncertainties,
-                                static_grid=world_grid_embed, xyzt_grid=world_grid_embed_FG,
+                                static_grid=world_grid_embed_fine, xyzt_grid=world_grid_embed_FG,
                                 coarse=False).to(device)
             else:
                 model_fine = BGFG_XYZT(num_layers=2,
                                 hidden_dim=64,
-                                geo_feat_dim=15,
+                                geo_feat_dim=64,
                                 num_layers_color=3,
                                 input_ch=input_ch, input_cam_ch=input_ch,
                                 input_ch_views=input_ch_views, input_ch_views_cam=input_ch_views,
                                 use_uncertainties=args.use_uncertainties,
-                                static_grid=world_grid_embed, xyzt_grid=world_grid_embed_FG, xyzt_grid_cam=camera_grid_embed,
+                                static_grid=world_grid_embed_fine, xyzt_grid=world_grid_embed_FG, xyzt_grid_cam=camera_grid_embed,
                                 coarse=False,
                                 use_viewdirs_FG=not args.no_views_FG,
                                 use_actor=args.use_actor_xyzt,
@@ -593,7 +615,7 @@ def create_nerf(args):
                                             input_ch=input_ch, input_cam_ch=input_ch,
                                             input_ch_views=input_ch_views, input_ch_views_cam=input_ch_views,
                                             use_uncertainties=args.use_uncertainties,
-                                            static_grid=world_grid_embed, FG_xyz_grid=world_grid_embed_FG,
+                                            static_grid=world_grid_embed_fine, FG_xyz_grid=world_grid_embed_FG,
                                             coarse=False).to(device)
         elif args.piecewise_constant:
             model_fine = BGFG_PiecewiseConst(xyzt_bounds=args.bounding_box,
@@ -604,7 +626,7 @@ def create_nerf(args):
                                             input_ch=input_ch, input_cam_ch=input_ch,
                                             input_ch_views=input_ch_views, input_ch_views_cam=input_ch_views,
                                             use_uncertainties=args.use_uncertainties,
-                                            static_grid=world_grid_embed,
+                                            static_grid=world_grid_embed_fine,
                                             coarse=False,
                                             init_temperature=args.init_temp,
                                             n_pieces=args.n_pieces).to(device)
@@ -616,7 +638,7 @@ def create_nerf(args):
                             input_ch=input_ch, input_cam_ch=input_ch,
                             input_ch_views=input_ch_views, input_ch_views_cam=input_ch_views,
                             use_uncertainties=args.use_uncertainties,
-                            world_grid_embed=world_grid_embed, world_grid_embed_FG=world_grid_embed_FG, camera_grid_embed=camera_grid_embed, time_grid_embed=time_grid_embed,
+                            world_grid_embed=world_grid_embed_fine, world_grid_embed_FG=world_grid_embed_FG, camera_grid_embed=camera_grid_embed, time_grid_embed=time_grid_embed,
                             big=args.big,
                             coarse=False).to(device)
 
@@ -1198,6 +1220,8 @@ def config_parser():
                         help='weight for BGFG ordering loss')
     parser.add_argument("--use-xyzt-bottleneck", action='store_true',
                         help="Use bottleneck with XYZT model")
+    parser.add_argument("--coarse-fine-separate", action='store_true',
+                        help="different embedding grid for coarse and fine models")
 
     ### The following didn't work:
     # parser.add_argument("--entropy-color", action='store_true', 
@@ -1271,6 +1295,8 @@ def train():
         if args.ordering_loss_weight > 0:
             args.expname += "_Order"+str(args.ordering_loss_weight)
         args.expname += "_lev"+str(args.xyzt_embed_levels)
+        if args.coarse_fine_separate:
+            args.expname += "_CFdiff"
     elif args.on_off_encoding:
         args.expname += "_BGFG_OnOff"
     elif args.piecewise_constant:
